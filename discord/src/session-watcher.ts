@@ -145,10 +145,14 @@ export class SessionWatcher {
       try {
         await Promise.race([
           this.pollSession(id, state),
-          new Promise((_, r) => setTimeout(() => r(new Error('Timeout')), 10000))
+          new Promise((_, r) => setTimeout(() => r(new Error('Timeout')), 30000))
         ])
       } catch (error: any) {
-        watcherLogger.debug(`Poll ${id} failed: ${error.message}`)
+        if (error.message !== 'Timeout') {
+          watcherLogger.error(`Poll ${id} failed: ${error.message}`)
+        } else {
+          watcherLogger.debug(`Poll ${id} timed out after 30s`)
+        }
       }
     }
   }
@@ -169,7 +173,17 @@ export class SessionWatcher {
       const msg = (item.info || item) as any
       const parts = (item.parts || msg.parts || []) as any[]
       
-      if (!msg.id || state.sentMessageIds.has(msg.id)) continue
+      if (!msg.id) continue
+      if (state.sentMessageIds.has(msg.id)) continue
+
+      // Double check DB to be absolutely sure (persistence layer)
+      const isSynced = this.getBotDatabase()
+        .prepare('SELECT 1 FROM synced_messages WHERE opencode_message_id = ? AND thread_id = ?')
+        .get(msg.id, state.threadId)
+      if (isSynced) {
+        state.sentMessageIds.add(msg.id)
+        continue
+      }
 
       if (msg.role === 'user') {
         const text = parts.filter(p => p.type === 'text').map(p => p.text).join('')
@@ -220,11 +234,16 @@ export class SessionWatcher {
     state.sentMessageIds.add(msg.id)
   }
 
-  private markMessageSynced(msgId: string, threadId: string, discordId: string = 'synced') {
+  public markMessageSynced(msgId: string, threadId: string, discordId: string = 'synced', sessionId?: string) {
     try {
       this.getBotDatabase()
         .prepare('INSERT OR REPLACE INTO synced_messages (opencode_message_id, thread_id, discord_message_id) VALUES (?, ?, ?)')
         .run(msgId, threadId, discordId)
+      
+      if (sessionId) {
+        const state = this.sessionStates.get(sessionId)
+        if (state) state.sentMessageIds.add(msgId)
+      }
     } catch {}
   }
 

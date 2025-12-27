@@ -1516,6 +1516,15 @@ async function handleOpencodeSession({
 
     sessionLogger.log(`Successfully sent prompt, got response`)
 
+    if (response.data) {
+      const watcher = sessionWatchers.get(directory)
+      const msgData = response.data as any
+      const userMsgId = msgData.userMessage?.id || msgData.userMessageID
+      if (watcher && userMsgId) {
+        watcher.markMessageSynced(userMsgId, thread.id, 'discord-origin', session.id)
+      }
+    }
+
     if (originalMessage) {
       try {
         await originalMessage.reactions.removeAll()
