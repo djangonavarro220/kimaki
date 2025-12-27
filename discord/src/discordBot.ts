@@ -50,129 +50,9 @@ import prettyMilliseconds from 'pretty-ms'
 import type { Session } from '@google/genai'
 import { createLogger } from './logger.js'
 import { isAbortError } from './utils.js'
-import { setGlobalDispatcher, Agent } from 'undici'
-// disables the automatic 5 minutes abort after no body
-setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0 }))
+import { SessionWatcher } from './session-watcher.js'
 
-type ParsedCommand = {
-  isCommand: true
-  command: string
-  arguments: string
-} | {
-  isCommand: false
-}
-function parseSlashCommand(text: string): ParsedCommand {
-  const trimmed = text.trim()
-  if (!trimmed.startsWith('/')) {
-    return { isCommand: false }
-  }
-  const match = trimmed.match(/^\/(\S+)(?:\s+(.*))?$/)
-  if (!match) {
-    return { isCommand: false }
-  }
-  const command = match[1]!
-  const args = match[2]?.trim() || ''
-  return { isCommand: true, command, arguments: args }
-}
-
-export function getOpencodeSystemMessage({ sessionId }: { sessionId: string }) {
-  return `
-The user is reading your messages from inside Discord, via kimaki.xyz
-
-The user cannot see bash tool outputs. If there is important information in bash output, include it in your text response.
-
-Your current OpenCode session ID is: ${sessionId}
-
-## permissions
-
-Only users with these Discord permissions can send messages to the bot:
-- Server Owner
-- Administrator permission
-- Manage Server permission
-- "Kimaki" role (case-insensitive)
-
-## changing the model
-
-To change the model used by OpenCode, edit the project's \`opencode.json\` config file and set the \`model\` field:
-
-\`\`\`json
-{
-  "model": "anthropic/claude-sonnet-4-20250514"
-}
-\`\`\`
-
-Examples:
-- \`"anthropic/claude-sonnet-4-20250514"\` - Claude Sonnet 4
-- \`"anthropic/claude-opus-4-20250514"\` - Claude Opus 4
-- \`"openai/gpt-4o"\` - GPT-4o
-- \`"google/gemini-2.5-pro"\` - Gemini 2.5 Pro
-
-Format is \`provider/model-name\`. You can also set \`small_model\` for tasks like title generation.
-
-## uploading files to discord
-
-To upload files to the Discord thread (images, screenshots, long files that would clutter the chat), run:
-
-npx -y kimaki upload-to-discord --session ${sessionId} <file1> [file2] ...
-
-## showing diffs
-
-After each message, if you implemented changes, you can show the user a diff via an url running the command, to show the changes in working directory:
-
-bunx critique web
-
-you can also show latest commit changes using
-
-bunx critique web HEAD~1
-
-do this in case you committed the changes yourself (only if the user asks so, never commit otherwise).
-
-## markdown
-
-discord does support basic markdown features like code blocks, code blocks languages, inline code, bold, italic, quotes, etc.
-
-the max heading level is 3, so do not use ####
-
-headings are discouraged anyway. instead try to use bold text for titles which renders more nicely in Discord
-
-## tables
-
-discord does NOT support markdown gfm tables.
-
-so instead of using full markdown tables ALWAYS show code snippets with space aligned cells:
-
-\`\`\`
-Item        Qty   Price
-----------  ---   -----
-Apples      10    $5
-Oranges     3     $2
-\`\`\`
-
-Using code blocks will make the content use monospaced font so that space will be aligned correctly
-
-IMPORTANT: add enough space characters to align the table! otherwise the content will not look good and will be difficult to understand for the user
-
-code blocks for tables and diagrams MUST have Max length of 85 characters. otherwise the content will wrap
-
-## diagrams
-
-you can create diagrams wrapping them in code blocks too.
-`
-}
-
-const discordLogger = createLogger('DISCORD')
-const voiceLogger = createLogger('VOICE')
-const opencodeLogger = createLogger('OPENCODE')
-const sessionLogger = createLogger('SESSION')
-const dbLogger = createLogger('DB')
-
-type StartOptions = {
-  token: string
-  appId?: string
-}
-
-// Map of project directory to OpenCode server process and client
-const opencodeServers = new Map<
+export const opencodeServers = new Map<
   string,
   {
     process: ChildProcess
@@ -180,6 +60,14 @@ const opencodeServers = new Map<
     port: number
   }
 >()
+
+const sessionWatchers = new Map<string, SessionWatcher>()
+
+const voiceLogger = createLogger('VOICE')
+const sessionLogger = createLogger('SESSION')
+const dbLogger = createLogger('DB')
+const opencodeLogger = createLogger('OPENCODE')
+const discordLogger = createLogger('DISCORD')
 
 // Map of session ID to current AbortController
 const abortControllers = new Map<string, AbortController>()
@@ -623,6 +511,16 @@ export function getDatabase(): Database.Database {
         message_id TEXT NOT NULL,
         thread_id TEXT NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `)
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS synced_messages (
+        opencode_message_id TEXT,
+        thread_id TEXT,
+        discord_message_id TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (opencode_message_id, thread_id)
       )
     `)
 
@@ -1370,7 +1268,7 @@ function formatTodoList(part: Part): string {
     .join('\n')
 }
 
-function formatPart(part: Part): string {
+export function formatPart(part: Part): string {
   if (part.type === 'text') {
     return part.text || ''
   }
@@ -1452,6 +1350,45 @@ export async function createDiscordClient() {
   })
 }
 
+export type ParsedCommand = {
+  isCommand: boolean
+  command: string
+  arguments: string
+}
+
+export type StartOptions = {
+  token: string
+  appId: string
+}
+
+export function parseSlashCommand(content: string): ParsedCommand {
+  const match = content.match(/^\/(\w+)(?:\s+(.*))?$/s)
+  if (match) {
+    return {
+      isCommand: true,
+      command: match[1] || '',
+      arguments: match[2] || '',
+    }
+  }
+  return {
+    isCommand: false,
+    command: '',
+    arguments: '',
+  }
+}
+
+export function getOpencodeSystemMessage({ sessionId }: { sessionId: string }) {
+  return `You are a helpful AI assistant integrated into a Discord server.
+Your responses should be formatted in Markdown.
+You have access to tools to interact with the project filesystem and other capabilities.
+Session ID: ${sessionId}
+
+When using tools, you can use multiple tools in parallel if needed.
+Always prefer using tools to answer questions about the codebase.
+`
+}
+
+
 async function handleOpencodeSession({
   prompt,
   thread,
@@ -1471,22 +1408,14 @@ async function handleOpencodeSession({
     `[OPENCODE SESSION] Starting for thread ${thread.id} with prompt: "${prompt.slice(0, 50)}${prompt.length > 50 ? '...' : ''}"`,
   )
 
-  // Track session start time
-  const sessionStartTime = Date.now()
-
-  // Use default directory if not specified
   const directory = projectDirectory || process.cwd()
   sessionLogger.log(`Using directory: ${directory}`)
 
-  // Note: We'll cancel the existing request after we have the session ID
-
   const getClient = await initializeOpencodeForDirectory(directory)
 
-  // Get the port for this directory
   const serverEntry = opencodeServers.get(directory)
   const port = serverEntry?.port
 
-  // Get session ID from database
   const row = getDatabase()
     .prepare('SELECT session_id FROM thread_sessions WHERE thread_id = ?')
     .get(thread.id) as { session_id: string } | undefined
@@ -1524,362 +1453,14 @@ async function handleOpencodeSession({
     throw new Error('Failed to create or get session')
   }
 
-  // Store session ID in database
   getDatabase()
     .prepare(
       'INSERT OR REPLACE INTO thread_sessions (thread_id, session_id) VALUES (?, ?)',
     )
     .run(thread.id, session.id)
-  dbLogger.log(`Stored session ${session.id} for thread ${thread.id}`)
-
-  // Cancel any existing request for this session
-  const existingController = abortControllers.get(session.id)
-  if (existingController) {
-    voiceLogger.log(
-      `[ABORT] Cancelling existing request for session: ${session.id}`,
-    )
-    existingController.abort(new Error('New request started'))
-  }
-
-  const abortController = new AbortController()
-  abortControllers.set(session.id, abortController)
-
-  if (existingController) {
-    await new Promise((resolve) => { setTimeout(resolve, 200) })
-    if (abortController.signal.aborted) {
-      sessionLogger.log(`[DEBOUNCE] Request was superseded during wait, exiting`)
-      return
-    }
-  }
-
-  if (abortController.signal.aborted) {
-    sessionLogger.log(`[DEBOUNCE] Aborted before subscribe, exiting`)
-    return
-  }
-
-  const eventsResult = await getClient().event.subscribe({
-    signal: abortController.signal,
-  })
-
-  if (abortController.signal.aborted) {
-    sessionLogger.log(`[DEBOUNCE] Aborted during subscribe, exiting`)
-    return
-  }
-
-  const events = eventsResult.stream
-  sessionLogger.log(`Subscribed to OpenCode events`)
-
-  const sentPartIds = new Set<string>(
-    (getDatabase()
-      .prepare('SELECT part_id FROM part_messages WHERE thread_id = ?')
-      .all(thread.id) as { part_id: string }[])
-      .map((row) => row.part_id)
-  )
-
-  let currentParts: Part[] = []
-  let stopTyping: (() => void) | null = null
-  let usedModel: string | undefined
-  let usedProviderID: string | undefined
-  let tokensUsedInSession = 0
-
-  let typingInterval: NodeJS.Timeout | null = null
-
-  function startTyping(): () => void {
-    if (abortController.signal.aborted) {
-      discordLogger.log(`Not starting typing, already aborted`)
-      return () => {}
-    }
-    if (typingInterval) {
-      clearInterval(typingInterval)
-      typingInterval = null
-    }
-
-    thread.sendTyping().catch((e) => {
-      discordLogger.log(`Failed to send initial typing: ${e}`)
-    })
-
-    typingInterval = setInterval(() => {
-      thread.sendTyping().catch((e) => {
-        discordLogger.log(`Failed to send periodic typing: ${e}`)
-      })
-    }, 8000)
-
-    if (!abortController.signal.aborted) {
-      abortController.signal.addEventListener(
-        'abort',
-        () => {
-          if (typingInterval) {
-            clearInterval(typingInterval)
-            typingInterval = null
-          }
-        },
-        { once: true },
-      )
-    }
-
-    return () => {
-      if (typingInterval) {
-        clearInterval(typingInterval)
-        typingInterval = null
-      }
-    }
-  }
-
-  const sendPartMessage = async (part: Part) => {
-    const content = formatPart(part) + '\n\n'
-    if (!content.trim() || content.length === 0) {
-      discordLogger.log(`SKIP: Part ${part.id} has no content`)
-      return
-    }
-
-    // Skip if already sent
-    if (sentPartIds.has(part.id)) {
-      return
-    }
-
-    try {
-      const firstMessage = await sendThreadMessage(thread, content)
-      sentPartIds.add(part.id)
-
-      // Store part-message mapping in database
-      getDatabase()
-        .prepare(
-          'INSERT OR REPLACE INTO part_messages (part_id, message_id, thread_id) VALUES (?, ?, ?)',
-        )
-        .run(part.id, firstMessage.id, thread.id)
-    } catch (error) {
-      discordLogger.error(`ERROR: Failed to send part ${part.id}:`, error)
-    }
-  }
-
-  const eventHandler = async () => {
-    try {
-      let assistantMessageId: string | undefined
-
-      for await (const event of events) {
-        if (event.type === 'message.updated') {
-          const msg = event.properties.info
-
-
-
-          if (msg.sessionID !== session.id) {
-            continue
-          }
-
-          // Track assistant message ID
-          if (msg.role === 'assistant') {
-            const newTokensTotal = msg.tokens.input + msg.tokens.output + msg.tokens.reasoning + msg.tokens.cache.read + msg.tokens.cache.write
-            if (newTokensTotal > 0) {
-              tokensUsedInSession = newTokensTotal
-            }
-
-            assistantMessageId = msg.id
-            usedModel = msg.modelID
-            usedProviderID = msg.providerID
-          }
-        } else if (event.type === 'message.part.updated') {
-          const part = event.properties.part
-
-
-          if (part.sessionID !== session.id) {
-            continue
-          }
-
-          // Only process parts from assistant messages
-          if (part.messageID !== assistantMessageId) {
-            continue
-          }
-
-          const existingIndex = currentParts.findIndex(
-            (p: Part) => p.id === part.id,
-          )
-          if (existingIndex >= 0) {
-            currentParts[existingIndex] = part
-          } else {
-            currentParts.push(part)
-          }
-
-
-
-          // Start typing on step-start
-          if (part.type === 'step-start') {
-            stopTyping = startTyping()
-          }
-
-          // Send tool parts immediately when they start running
-          if (part.type === 'tool' && part.state.status === 'running') {
-            await sendPartMessage(part)
-          }
-
-          // Send reasoning parts immediately (shows "◼︎ thinking" indicator early)
-          if (part.type === 'reasoning') {
-            await sendPartMessage(part)
-          }
-
-          // Check if this is a step-finish part
-          if (part.type === 'step-finish') {
-
-            // Send all parts accumulated so far to Discord
-            for (const p of currentParts) {
-              // Skip step-start and step-finish parts as they have no visual content
-              if (p.type !== 'step-start' && p.type !== 'step-finish') {
-                await sendPartMessage(p)
-              }
-            }
-            // start typing in a moment, so that if the session finished, because step-finish is at the end of the message, we do not show typing status
-            setTimeout(() => {
-              if (abortController.signal.aborted) return
-              stopTyping = startTyping()
-            }, 300)
-          }
-        } else if (event.type === 'session.error') {
-          sessionLogger.error(`ERROR:`, event.properties)
-          if (event.properties.sessionID === session.id) {
-            const errorData = event.properties.error
-            const errorMessage = errorData?.data?.message || 'Unknown error'
-            sessionLogger.error(`Sending error to thread: ${errorMessage}`)
-            await sendThreadMessage(
-              thread,
-              `✗ opencode session error: ${errorMessage}`,
-            )
-
-            // Update reaction to error
-            if (originalMessage) {
-              try {
-                await originalMessage.reactions.removeAll()
-                await originalMessage.react('❌')
-                voiceLogger.log(
-                  `[REACTION] Added error reaction due to session error`,
-                )
-              } catch (e) {
-                discordLogger.log(`Could not update reaction:`, e)
-              }
-            }
-          } else {
-            voiceLogger.log(
-              `[SESSION ERROR IGNORED] Error for different session (expected: ${session.id}, got: ${event.properties.sessionID})`,
-            )
-          }
-          break
-        } else if (event.type === 'permission.updated') {
-          const permission = event.properties
-          if (permission.sessionID !== session.id) {
-            voiceLogger.log(
-              `[PERMISSION IGNORED] Permission for different session (expected: ${session.id}, got: ${permission.sessionID})`,
-            )
-            continue
-          }
-
-          sessionLogger.log(
-            `Permission requested: type=${permission.type}, title=${permission.title}`,
-          )
-
-          const patternStr = Array.isArray(permission.pattern)
-            ? permission.pattern.join(', ')
-            : permission.pattern || ''
-
-          const permissionMessage = await sendThreadMessage(
-            thread,
-            `⚠️ **Permission Required**\n\n` +
-              `**Type:** \`${permission.type}\`\n` +
-              `**Action:** ${permission.title}\n` +
-              (patternStr ? `**Pattern:** \`${patternStr}\`\n` : '') +
-              `\nUse \`/accept\` or \`/reject\` to respond.`,
-          )
-
-          pendingPermissions.set(thread.id, {
-            permission,
-            messageId: permissionMessage.id,
-            directory,
-          })
-        } else if (event.type === 'permission.replied') {
-          const { permissionID, response, sessionID } = event.properties
-          if (sessionID !== session.id) {
-            continue
-          }
-
-          sessionLogger.log(
-            `Permission ${permissionID} replied with: ${response}`,
-          )
-
-          const pending = pendingPermissions.get(thread.id)
-          if (pending && pending.permission.id === permissionID) {
-            pendingPermissions.delete(thread.id)
-          }
-        }
-      }
-    } catch (e) {
-      if (isAbortError(e, abortController.signal)) {
-        sessionLogger.log(
-          'AbortController aborted event handling (normal exit)',
-        )
-        return
-      }
-      sessionLogger.error(`Unexpected error in event handling code`, e)
-      throw e
-    } finally {
-      // Send any remaining parts that weren't sent
-      for (const part of currentParts) {
-        if (!sentPartIds.has(part.id)) {
-          try {
-            await sendPartMessage(part)
-          } catch (error) {
-            sessionLogger.error(`Failed to send part ${part.id}:`, error)
-          }
-        }
-      }
-
-      // Stop typing when session ends
-      if (stopTyping) {
-        stopTyping()
-        stopTyping = null
-      }
-
-      // Only send duration message if request was not aborted or was aborted with 'finished' reason
-      if (
-        !abortController.signal.aborted ||
-        abortController.signal.reason === 'finished'
-      ) {
-        const sessionDuration = prettyMilliseconds(
-          Date.now() - sessionStartTime,
-        )
-        const attachCommand = port ? ` ⋅ ${session.id}` : ''
-        const modelInfo = usedModel ? ` ⋅ ${usedModel}` : ''
-        let contextInfo = ''
-
-
-        try {
-          const providersResponse = await getClient().provider.list({ query: { directory } })
-          const provider = providersResponse.data?.all?.find((p) => p.id === usedProviderID)
-          const model = provider?.models?.[usedModel || '']
-          if (model?.limit?.context) {
-            const percentage = Math.round((tokensUsedInSession / model.limit.context) * 100)
-            contextInfo = ` ⋅ ${percentage}%`
-          }
-        } catch (e) {
-          sessionLogger.error('Failed to fetch provider info for context percentage:', e)
-        }
-
-        await sendThreadMessage(thread, `_Completed in ${sessionDuration}${contextInfo}_${attachCommand}${modelInfo}`)
-        sessionLogger.log(`DURATION: Session completed in ${sessionDuration}, port ${port}, model ${usedModel}, tokens ${tokensUsedInSession}`)
-      } else {
-        sessionLogger.log(
-          `Session was aborted (reason: ${abortController.signal.reason}), skipping duration message`,
-        )
-      }
-    }
-  }
+  sessionLogger.log(`Stored session ${session.id} for thread ${thread.id}`)
 
   try {
-    const eventHandlerPromise = eventHandler()
-
-    if (abortController.signal.aborted) {
-      sessionLogger.log(`[DEBOUNCE] Aborted before prompt, exiting`)
-      return
-    }
-
-    stopTyping = startTyping()
-
     let response: { data?: unknown; error?: unknown; response: Response }
     if (parsedCommand?.isCommand) {
       sessionLogger.log(
@@ -1891,9 +1472,13 @@ async function handleOpencodeSession({
           command: parsedCommand.command,
           arguments: parsedCommand.arguments,
         },
-        signal: abortController.signal,
       })
     } else {
+      const watcher = sessionWatchers.get(directory)
+      if (watcher) {
+        watcher.setLastDiscordPrompt(prompt)
+      }
+
       voiceLogger.log(
         `[PROMPT] Sending prompt to session ${session.id}: "${prompt.slice(0, 100)}${prompt.length > 100 ? '...' : ''}"`,
       )
@@ -1910,7 +1495,6 @@ async function handleOpencodeSession({
           parts,
           system: getOpencodeSystemMessage({ sessionId: session.id }),
         },
-        signal: abortController.signal,
       })
     }
 
@@ -1930,8 +1514,6 @@ async function handleOpencodeSession({
       throw new Error(`OpenCode API error (${response.response.status}): ${errorMessage}`)
     }
 
-    abortController.abort('finished')
-
     sessionLogger.log(`Successfully sent prompt, got response`)
 
     if (originalMessage) {
@@ -1947,35 +1529,32 @@ async function handleOpencodeSession({
   } catch (error) {
     sessionLogger.error(`ERROR: Failed to send prompt:`, error)
 
-    if (!isAbortError(error, abortController.signal)) {
-      abortController.abort('error')
-
-      if (originalMessage) {
-        try {
-          await originalMessage.reactions.removeAll()
-          await originalMessage.react('❌')
-          discordLogger.log(`Added error reaction to message`)
-        } catch (e) {
-          discordLogger.log(`Could not update reaction:`, e)
-        }
+    if (originalMessage) {
+      try {
+        await originalMessage.reactions.removeAll()
+        await originalMessage.react('❌')
+        discordLogger.log(`Added error reaction to message`)
+      } catch (e) {
+        discordLogger.log(`Could not update reaction:`, e)
       }
-      const errorName =
-        error &&
-        typeof error === 'object' &&
-        'constructor' in error &&
-        error.constructor &&
-        typeof error.constructor.name === 'string'
-          ? error.constructor.name
-          : typeof error
-      const errorMsg =
-        error instanceof Error ? error.stack || error.message : String(error)
-      await sendThreadMessage(
-        thread,
-        `✗ Unexpected bot Error: [${errorName}]\n${errorMsg}`,
-      )
     }
+    const errorName =
+      error &&
+      typeof error === 'object' &&
+      'constructor' in error &&
+      error.constructor &&
+      typeof error.constructor.name === 'string'
+        ? error.constructor.name
+        : typeof error
+    const errorMsg =
+      error instanceof Error ? error.stack || error.message : String(error)
+    await sendThreadMessage(
+      thread,
+      `✗ Unexpected bot Error: [${errorName}]\n${errorMsg}`,
+    )
   }
 }
+
 
 export type ChannelWithTags = {
   id: string
@@ -2033,7 +1612,7 @@ export async function startDiscordBot({
   // Get the app ID for this bot instance
   let currentAppId: string | undefined = appId
 
-  discordClient.once(Events.ClientReady, async (c) => {
+  const onReady = async (c: Client<true>) => {
     discordLogger.log(`Discord bot logged in as ${c.user.tag}`)
     discordLogger.log(`Connected to ${c.guilds.cache.size} guild(s)`)
     discordLogger.log(`Bot user ID: ${c.user.id}`)
@@ -2079,7 +1658,41 @@ export async function startDiscordBot({
     voiceLogger.log(
       `[READY] Bot is ready and will only respond to channels with app ID: ${currentAppId}`,
     )
-  })
+
+    // Start session watchers for all registered directories
+    const registeredDirs = getDatabase()
+      .prepare('SELECT DISTINCT directory FROM channel_directories WHERE channel_type = ?')
+      .all('text') as { directory: string }[]
+
+    for (const { directory } of registeredDirs) {
+      if (sessionWatchers.has(directory)) {
+        continue
+      }
+      try {
+        const getClient = await initializeOpencodeForDirectory(directory)
+        const watcher = new SessionWatcher({
+          directory,
+          getClient,
+          discordClient: c,
+          getDatabase,
+          formatPart,
+          sendThreadMessage,
+        })
+        await watcher.start()
+        sessionWatchers.set(directory, watcher)
+        discordLogger.log(`Started session watcher for ${directory}`)
+      } catch (error) {
+        discordLogger.error(`Failed to start session watcher for ${directory}:`, error)
+      }
+    }
+  }
+
+  if (discordClient.isReady()) {
+    onReady(discordClient as Client<true>)
+  } else {
+    discordClient.once(Events.ClientReady, onReady)
+  }
+
 
   discordClient.on(Events.MessageCreate, async (message: Message) => {
     try {
@@ -2735,7 +2348,13 @@ export async function startDiscordBot({
                 `[RESUME] Created thread ${thread.id} for session ${sessionId}`,
               )
 
-              // Fetch all messages for the session
+              voiceLogger.log(`[WATCHER-DEBUG] Looking for watcher: "${projectDirectory}". Available watchers: ${Array.from(sessionWatchers.keys()).map(k => `"${k}"`).join(', ')}`)
+              const watcher = sessionWatchers.get(projectDirectory!)
+              if (watcher) {
+                watcher.watchSession(sessionId, thread.id)
+              } else {
+                voiceLogger.error(`[WATCHER-DEBUG] No watcher found for directory: "${projectDirectory}"`)
+              }
               const messagesResponse = await getClient().session.messages({
                 path: { id: sessionId },
               })
@@ -2803,6 +2422,21 @@ export async function startDiscordBot({
 
                 transaction(partsToRender)
               }
+
+              // Mark all messages as synced to prevent watcher from re-syncing them
+              const syncStmt = getDatabase().prepare(
+                'INSERT OR REPLACE INTO synced_messages (opencode_message_id, thread_id, discord_message_id) VALUES (?, ?, ?)',
+              )
+              const syncTransaction = getDatabase().transaction(
+                (msgs: { info: { id: string } }[]) => {
+                  for (const msg of msgs) {
+                    if (msg.info?.id) {
+                      syncStmt.run(msg.info.id, thread.id, 'resumed')
+                    }
+                  }
+                },
+              )
+              syncTransaction(messages)
 
               const messageCount = messages.length
 
