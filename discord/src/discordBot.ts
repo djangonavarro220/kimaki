@@ -1295,7 +1295,12 @@ function getToolSummaryText(part: Part): string {
   if (part.tool === 'write') {
     const filePath = (part.state.input?.filePath as string) || ''
     const content = (part.state.input?.content as string) || ''
-    const lines = content.split('\n').length
+
+    if (content && typeof content !== 'string') {
+      discordLogger.warn(`[WRITE TOOL] Content is not a string. Type: ${typeof content}. File: ${filePath}`)
+    }
+
+    const lines = content && typeof content === 'string' ? content.split('\n').length : 0
     const fileName = filePath.split('/').pop() || ''
     return fileName ? `*${fileName}* (${lines} line${lines === 1 ? '' : 's'})` : `(${lines} line${lines === 1 ? '' : 's'})`
   }
