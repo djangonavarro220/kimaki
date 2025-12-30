@@ -158,7 +158,7 @@ export class GlobalEventWatcher {
     if (postStatus) {
         try {
             const link = buildThreadLink(originThread.guildId, shadowThread.id)
-            statusMsg = await this.deps.sendThreadMessage(originThread, `🧠 Thinking... [View Process](${link})`)
+            statusMsg = await this.deps.sendThreadMessage(originThread, `🧠 [Thinking](${link})`)
             this.statusMessages.set(messageId, statusMsg)
         } catch (e) {
             watcherLogger.error('Failed to post status message:', e)
@@ -642,15 +642,8 @@ export class GlobalEventWatcher {
                 this.activeInteractions.delete(thread.id)
             }
 
-            // 3. Update/Delete Status Message in MAIN thread
+            // 3. Update Status Message in MAIN thread
             const statusMsg = activeInteraction?.statusMessage || this.statusMessages.get(msg.id)
-            if (statusMsg) {
-                try {
-                    await statusMsg.delete()
-                } catch {
-                    // Ignore delete errors
-                }
-            }
 
             // Cleanup text buffers
             if (activeInteraction) {
@@ -662,9 +655,22 @@ export class GlobalEventWatcher {
             }
 
             try {
-              await this.sendCompletionSummary(thread, msg)
+              const summary = this.buildCompletionSummary(msg)
+              const shadowThreadId = activeInteraction?.shadowThreadId || this.shadowThreadIds.get(msg.id)
+              const link = shadowThreadId ? buildThreadLink(thread.guildId, shadowThreadId) : ''
+              const statusText = link
+                ? `✅ [Complete](${link})${summary ? ` • ${summary}` : ''}`
+                : `✅ Complete${summary ? ` • ${summary}` : ''}`
+
+              if (statusText.trim()) {
+                if (statusMsg) {
+                  await statusMsg.edit(statusText)
+                } else {
+                  await this.deps.sendThreadMessage(thread, statusText)
+                }
+              }
             } catch (e) {
-              watcherLogger.error(`Failed to send completion summary:`, e)
+              watcherLogger.error(`Failed to update completion status:`, e)
             }
           }
         }
@@ -783,9 +789,9 @@ export class GlobalEventWatcher {
   }
 
   /**
-   * Send completion summary
+   * Build completion summary line
    */
-  private async sendCompletionSummary(thread: ThreadChannel, msg: any) {
+  private buildCompletionSummary(msg: any): string {
     const tokens = msg.tokens || {}
     const info = msg
     
@@ -811,7 +817,6 @@ export class GlobalEventWatcher {
         
         summaryParts.push(tokensStr)
       }
-      
     }
 
     // Calculate duration if we have timing info
@@ -826,9 +831,7 @@ export class GlobalEventWatcher {
       summaryParts.push(`Model: ${info.modelID}`)
     }
 
-    if (summaryParts.length > 0) {
-      await this.deps.sendThreadMessage(thread, `-# Completed. ${summaryParts.join(' • ')}`)
-    }
+    return summaryParts.join(' • ')
   }
 
   /**
