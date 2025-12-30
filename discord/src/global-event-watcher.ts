@@ -10,10 +10,14 @@ import {
   type OpencodeClient,
   type Part,
 } from '@opencode-ai/sdk'
-import type { Client as DiscordClient, ThreadChannel, Message } from 'discord.js'
+import type { Client as DiscordClient, ThreadChannel, Message, TextChannel } from 'discord.js'
 import type Database from 'better-sqlite3'
 import prettyMilliseconds from 'pretty-ms'
 import { createLogger } from './logger.js'
+import { getOrCreateShadowChannel, createShadowThread, buildThreadLink } from './shadow-threads.js'
+import { ShadowStreamRouter } from './stream-router.js'
+import { formatPartForShadow } from './message-format.js'
+import { splitDiscordMessage } from './chunking.js'
 
 const watcherLogger = createLogger('WATCHER')
 
@@ -66,9 +70,109 @@ export class GlobalEventWatcher {
   private backfillInterval: NodeJS.Timeout | null = null
   private static BACKFILL_INTERVAL_MS = 30000 // 30 seconds
 
+  // Shadow thread management
+  private shadowRouters = new Map<string, ShadowStreamRouter>() // messageId -> router
+  private partOffsets = new Map<string, number>() // partId -> length sent
+  private shadowThreadIds = new Map<string, string>() // messageId -> threadId
+  private statusMessages = new Map<string, Message>() // messageId -> status message object
+  private partStatuses = new Map<string, Set<string>>() // partId -> set of sent states ('input', 'output')
+
+  // Track active interaction per thread (to reuse shadow thread across multiple assistant messages in one turn)
+  private activeInteractions = new Map<string, {
+    router: ShadowStreamRouter
+    statusMessage: Message
+    shadowThreadId: string
+    messageIds: Set<string> // Track all message IDs associated with this interaction for cleanup
+  }>()
+
   constructor(port: number, deps: WatcherDependencies) {
     this.port = port
     this.deps = deps
+  }
+
+  /**
+   * Ensure a shadow thread exists for this message
+   */
+  private async ensureShadowThread(
+    messageId: string,
+    originThread: ThreadChannel,
+    options: { postStatus?: boolean; trackInteraction?: boolean } = {},
+  ): Promise<ShadowStreamRouter | null> {
+    const { postStatus = true, trackInteraction = true } = options
+    if (this.shadowRouters.has(messageId)) {
+      return this.shadowRouters.get(messageId)!
+    }
+
+    // Check if we already have an active interaction for this thread
+    const activeInteraction = this.activeInteractions.get(originThread.id)
+    if (activeInteraction) {
+      // Reuse existing router for this new message
+      this.shadowRouters.set(messageId, activeInteraction.router)
+      this.shadowThreadIds.set(messageId, activeInteraction.shadowThreadId)
+      // Update status message map so finalization can find it
+      if (activeInteraction.statusMessage) {
+        this.statusMessages.set(messageId, activeInteraction.statusMessage)
+      }
+      
+      // Track this message ID for later cleanup
+      if (trackInteraction) {
+        activeInteraction.messageIds.add(messageId)
+      }
+      
+      return activeInteraction.router
+    }
+
+    // Determine parent channel
+    const parentChannel = originThread.parent as TextChannel | null
+    if (!parentChannel) {
+        // Can happen if thread is in guild root? Unlikely for TextChannel threads.
+        // Or if cached data is incomplete.
+        // Try fetching
+        try {
+           await originThread.fetch()
+        } catch {}
+        if (!originThread.parent) {
+           watcherLogger.error(`Thread ${originThread.id} has no parent channel`)
+           return null
+        }
+    }
+
+    // Get/Create Shadow Channel
+    const shadowChannel = await getOrCreateShadowChannel(originThread.guild, parentChannel as TextChannel)
+    if (!shadowChannel) return null
+
+    // Create Shadow Thread
+    const shadowThread = await createShadowThread(shadowChannel, originThread)
+    if (!shadowThread) return null
+
+    // Create Router
+    const router = new ShadowStreamRouter(shadowThread)
+    this.shadowRouters.set(messageId, router)
+    this.shadowThreadIds.set(messageId, shadowThread.id)
+
+    // Post Status Message in Main Thread
+    let statusMsg: Message | undefined
+    if (postStatus) {
+        try {
+            const link = buildThreadLink(originThread.guildId, shadowThread.id)
+            statusMsg = await this.deps.sendThreadMessage(originThread, `🧠 Thinking... [View Process](${link})`)
+            this.statusMessages.set(messageId, statusMsg)
+        } catch (e) {
+            watcherLogger.error('Failed to post status message:', e)
+        }
+    }
+
+    // Store as active interaction
+    if (trackInteraction && statusMsg) {
+        this.activeInteractions.set(originThread.id, {
+            router,
+            statusMessage: statusMsg,
+            shadowThreadId: shadowThread.id,
+            messageIds: new Set([messageId])
+        })
+    }
+
+    return router
   }
 
   /**
@@ -247,13 +351,13 @@ export class GlobalEventWatcher {
     watcherLogger.log(`Backfill completed for ${sessions.length} sessions`)
   }
 
-  /**
+   /**
    * Backfill a single session
    * 
-   * NOTE: We skip text parts in backfill because they may be incomplete during streaming.
-   * Text parts should only be sent via SSE step-finish to ensure complete content.
+   * NOTE: Backfill routes assistant content to shadow threads only.
    * We also skip sessions that are actively streaming (have pending parts in sessionParts).
    */
+
   private async backfillSession(sessionId: string, threadId: string): Promise<void> {
     if (!this.client) return
 
@@ -272,34 +376,94 @@ export class GlobalEventWatcher {
     }
 
     const messages = messagesResponse.data
+    const thread = await this.getThread(threadId)
+    if (!thread) return
+
     let backfilledCount = 0
+    let backfillRouter: ShadowStreamRouter | null = null
+    let backfillShadowThreadId: string | null = null
+    const backfillMessageIds = new Set<string>()
+    let interactionSentAny = false
 
     for (const message of messages) {
       if (message.info.role !== 'assistant') continue
+      const messageId = message.info?.id
+      if (!messageId) continue
 
       for (const part of message.parts) {
         if (this.isPartSent(part.id)) continue
         if (part.type === 'step-start' || part.type === 'step-finish') continue
-        
-        // Skip text parts in backfill - they should only come via SSE step-finish
-        // to ensure we get complete content (not partial streaming content)
-        if (part.type === 'text') continue
 
-        // This part was missed - send it now
-        const thread = await this.getThread(threadId)
-        if (!thread) continue
+        let formatted = ''
 
-        const content = this.deps.formatPart(part)
-        // Ensure content is a string and not empty
-        if (typeof content !== 'string' || !content.trim()) continue
-
-        try {
-          const discordMessage = await this.deps.sendThreadMessage(thread, content + '\n\n')
-          this.recordPartSent(part.id, discordMessage.id, threadId)
-          backfilledCount++
-        } catch (e) {
-          watcherLogger.error(`Failed to backfill part ${part.id}:`, e)
+        if (part.type === 'reasoning' && part.text) {
+          formatted = formatPartForShadow('reasoning', part.text)
+        } else if (part.type === 'tool' && part.state) {
+          if (part.state.status === 'running' && part.state.input) {
+            formatted = formatPartForShadow('tool-input', { tool: part.tool, input: part.state.input })
+          } else if (part.state.status === 'completed') {
+            formatted = formatPartForShadow('tool-output', { tool: part.tool, output: part.state.output })
+          } else if (part.state.status === 'error') {
+            formatted = formatPartForShadow('tool-error', { error: part.state.error })
+          }
+        } else if (part.type === 'patch') {
+          const diffText = (part as any).diff || (part as any).text
+          if (diffText) formatted = formatPartForShadow('diff', diffText)
+        } else if (part.type === 'text' && part.text) {
+          formatted = formatPartForShadow('text', part.text)
         }
+
+        if (!formatted.trim()) continue
+
+        if (!backfillRouter) {
+          backfillRouter = await this.ensureShadowThread(messageId, thread, { postStatus: false, trackInteraction: false })
+          if (!backfillRouter) break
+          backfillShadowThreadId = this.shadowThreadIds.get(messageId) ?? null
+        }
+
+        if (!backfillRouter) continue
+
+        // Track message IDs for cleanup
+        this.shadowRouters.set(messageId, backfillRouter)
+        if (backfillShadowThreadId) this.shadowThreadIds.set(messageId, backfillShadowThreadId)
+        backfillMessageIds.add(messageId)
+
+        backfillRouter.append(formatted)
+        interactionSentAny = true
+
+        // Record as sent to avoid duplicate backfills
+        const recordedMessageId = backfillShadowThreadId || messageId
+        const recordedThreadId = backfillShadowThreadId || threadId
+        this.recordPartSent(part.id, recordedMessageId, recordedThreadId)
+        backfilledCount++
+      }
+
+      if (message.info.finish === 'stop' && backfillRouter) {
+        if (interactionSentAny) {
+          await backfillRouter.end()
+        } else {
+          await backfillRouter.flush()
+        }
+
+        for (const mid of backfillMessageIds) {
+          this.shadowRouters.delete(mid)
+          this.shadowThreadIds.delete(mid)
+          this.statusMessages.delete(mid)
+        }
+
+        backfillRouter = null
+        backfillShadowThreadId = null
+        backfillMessageIds.clear()
+        interactionSentAny = false
+      }
+    }
+
+    if (backfillRouter && interactionSentAny) {
+      await backfillRouter.flush()
+      for (const mid of backfillMessageIds) {
+        this.shadowRouters.delete(mid)
+        this.shadowThreadIds.delete(mid)
+        this.statusMessages.delete(mid)
       }
     }
 
@@ -426,11 +590,62 @@ export class GlobalEventWatcher {
         this.messageRoles.set(msg.id, msg.role)
         
         // Handle assistant message completion summary when message finishes with 'stop'
-        // 'stop' means the agent finished responding, 'tool-calls' means it's doing tools
         if (msg.role === 'assistant' && msg.finish === 'stop') {
           const lastId = this.lastCompletedMessageIds.get(sessionId)
           if (lastId !== msg.id) {
             this.lastCompletedMessageIds.set(sessionId, msg.id)
+            
+            // 1. Send Final Text to MAIN thread (clean)
+            const textParts = (msg.parts || [])
+                .filter((p: any) => p.type === 'text')
+                .map((p: any) => p.text)
+                .join('')
+            
+            if (textParts.trim()) {
+                const chunks = splitDiscordMessage(textParts)
+                for (const chunk of chunks) {
+                    await this.deps.sendThreadMessage(thread, chunk)
+                }
+            }
+
+            // 2. Finalize Shadow Thread
+            // Retrieve router via message ID (mapped during ensureShadowThread)
+            const router = this.shadowRouters.get(msg.id)
+            
+            // Get active interaction to cleanup ALL associated message IDs
+            const activeInteraction = this.activeInteractions.get(thread.id)
+            
+            if (router) {
+                await router.end()
+                
+                // Cleanup all mappings for this interaction
+                if (activeInteraction) {
+                    for (const mid of activeInteraction.messageIds) {
+                        this.shadowRouters.delete(mid)
+                        this.shadowThreadIds.delete(mid)
+                        this.statusMessages.delete(mid)
+                    }
+                } else {
+                    // Fallback for single message (shouldn't happen with new logic)
+                    this.shadowRouters.delete(msg.id)
+                    this.shadowThreadIds.delete(msg.id)
+                    this.statusMessages.delete(msg.id)
+                }
+                
+                // Clear active interaction for this thread
+                this.activeInteractions.delete(thread.id)
+            }
+
+            // 3. Update/Delete Status Message in MAIN thread
+            const statusMsg = activeInteraction?.statusMessage || this.statusMessages.get(msg.id)
+            if (statusMsg) {
+                try {
+                    await statusMsg.delete()
+                } catch {
+                    // Ignore delete errors
+                }
+            }
+
             try {
               await this.sendCompletionSummary(thread, msg)
             } catch (e) {
@@ -443,60 +658,92 @@ export class GlobalEventWatcher {
       const part = event.properties.part as Part
       const role = this.messageRoles.get(part.messageID) || 'assistant'
 
-      // Handle User messages (TUI prompts) immediately
+      // Handle User messages (TUI prompts) immediately -> Echo to Main
       if (role === 'user' && part.type === 'text') {
         await this.sendPart(part, thread, threadId, role)
         return
       }
 
-      // Get or create parts array for this session (Assistant only)
-      let parts = this.sessionParts.get(sessionId)
-      if (!parts) {
-        parts = []
-        this.sessionParts.set(sessionId, parts)
-      }
+      // Handle Assistant messages -> Route to Shadow
+      if (role === 'assistant') {
+          // Initialize Shadow Thread if needed
+          const router = await this.ensureShadowThread(part.messageID, thread)
+          if (!router) return
 
-      // Update or add part
-      const existingIndex = parts.findIndex(p => p.id === part.id)
-      if (existingIndex >= 0) {
-        parts[existingIndex] = part
-      } else {
-        parts.push(part)
-      }
-
-      // Handle typing on step-start
-      if (part.type === 'step-start') {
-        this.startTyping(threadId, thread)
-      }
-
-      // Send tool parts immediately when running
-      if (part.type === 'tool' && part.state.status === 'running') {
-        await this.sendPart(part, thread, threadId, role)
-      }
-
-      // Send reasoning parts immediately
-      if (part.type === 'reasoning') {
-        await this.sendPart(part, thread, threadId, role)
-      }
-
-      // On step-finish, send all accumulated parts
-      if (part.type === 'step-finish') {
-        this.stopTyping(threadId)
-        
-        for (const p of parts) {
-          if (p.type !== 'step-start' && p.type !== 'step-finish') {
-            await this.sendPart(p, thread, threadId, role)
+          // --- Reasoning ---
+          if (part.type === 'reasoning') {
+             const currentLen = part.text?.length || 0
+             const previousLen = this.partOffsets.get(part.id) || 0
+             const delta = part.text?.slice(previousLen) || ''
+             this.partOffsets.set(part.id, currentLen)
+             
+             if (delta) {
+                 router.append(formatPartForShadow('reasoning', delta))
+             }
           }
-        }
+          
+          // --- Text (Streaming) ---
+          if (part.type === 'text') {
+             const currentLen = part.text?.length || 0
+             const previousLen = this.partOffsets.get(part.id) || 0
+             const delta = part.text?.slice(previousLen) || ''
+             this.partOffsets.set(part.id, currentLen)
+             
+             if (delta) {
+                 router.append(delta) // Raw text append
+             }
+          }
 
-        // Clear accumulated parts after sending
-        this.sessionParts.delete(sessionId)
+          // --- Tool ---
+          if (part.type === 'tool') {
+             const statuses = this.partStatuses.get(part.id) || new Set()
+             
+             if (part.state.status === 'running' && part.state.input && !statuses.has('input')) {
+                 router.append(formatPartForShadow('tool-input', { tool: part.tool, input: part.state.input }))
+                 statuses.add('input')
+                 this.partStatuses.set(part.id, statuses)
+             }
+             
+             if (part.state.status === 'completed' && !statuses.has('output')) {
+                 router.append(formatPartForShadow('tool-output', { tool: part.tool, output: part.state.output }))
+                 statuses.add('output')
+                 this.partStatuses.set(part.id, statuses)
+             }
+             
+             if (part.state.status === 'error' && !statuses.has('error')) {
+                 router.append(formatPartForShadow('tool-error', { error: part.state.error }))
+                 statuses.add('error')
+                 this.partStatuses.set(part.id, statuses)
+             }
+          }
+          
+          // --- Diff/Patch ---
+          if (part.type === 'patch') {
+              const diffText = (part as any).diff || (part as any).text
+              const statuses = this.partStatuses.get(part.id) || new Set()
+              
+              if (diffText && !statuses.has('diff')) {
+                  router.append(formatPartForShadow('diff', diffText))
+                  statuses.add('diff')
+                  this.partStatuses.set(part.id, statuses)
+              }
+          }
+
+          // Typing indicator logic
+          if (part.type === 'step-start') {
+            this.startTyping(threadId, thread)
+          } else if (part.type === 'step-finish') {
+            this.stopTyping(threadId)
+          }
       }
+
     } else if (event.type === 'session.completed') {
       this.stopTyping(threadId)
       this.sessionParts.delete(sessionId)
+      this.activeInteractions.delete(threadId)
     } else if (event.type === 'session.error') {
       this.stopTyping(threadId)
+      this.activeInteractions.delete(threadId)
       const errorMessage = event.properties?.error?.data?.message || 'Unknown error'
       try {
         await this.deps.sendThreadMessage(thread, `**Error:** ${errorMessage}`)
