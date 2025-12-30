@@ -85,6 +85,9 @@ export class GlobalEventWatcher {
     messageIds: Set<string> // Track all message IDs associated with this interaction for cleanup
   }>()
 
+  // Accumulate assistant text deltas per message for final delivery
+  private messageTextBuffers = new Map<string, string>()
+
   constructor(port: number, deps: WatcherDependencies) {
     this.port = port
     this.deps = deps
@@ -601,8 +604,11 @@ export class GlobalEventWatcher {
                 .map((p: any) => p.text)
                 .join('')
             
-            if (textParts.trim()) {
-                const chunks = splitDiscordMessage(textParts)
+            const bufferedText = this.messageTextBuffers.get(msg.id) || ''
+            const finalText = textParts.trim() ? textParts : bufferedText
+            
+            if (finalText.trim()) {
+                const chunks = splitDiscordMessage(finalText)
                 for (const chunk of chunks) {
                     await this.deps.sendThreadMessage(thread, chunk)
                 }
@@ -644,6 +650,15 @@ export class GlobalEventWatcher {
                 } catch {
                     // Ignore delete errors
                 }
+            }
+
+            // Cleanup text buffers
+            if (activeInteraction) {
+                for (const mid of activeInteraction.messageIds) {
+                    this.messageTextBuffers.delete(mid)
+                }
+            } else {
+                this.messageTextBuffers.delete(msg.id)
             }
 
             try {
@@ -691,6 +706,8 @@ export class GlobalEventWatcher {
              
              if (delta) {
                  router.append(delta) // Raw text append
+                 const previousText = this.messageTextBuffers.get(part.messageID) || ''
+                 this.messageTextBuffers.set(part.messageID, previousText + delta)
              }
           }
 
@@ -740,9 +757,21 @@ export class GlobalEventWatcher {
     } else if (event.type === 'session.completed') {
       this.stopTyping(threadId)
       this.sessionParts.delete(sessionId)
+      const activeInteraction = this.activeInteractions.get(threadId)
+      if (activeInteraction) {
+        for (const mid of activeInteraction.messageIds) {
+          this.messageTextBuffers.delete(mid)
+        }
+      }
       this.activeInteractions.delete(threadId)
     } else if (event.type === 'session.error') {
       this.stopTyping(threadId)
+      const activeInteraction = this.activeInteractions.get(threadId)
+      if (activeInteraction) {
+        for (const mid of activeInteraction.messageIds) {
+          this.messageTextBuffers.delete(mid)
+        }
+      }
       this.activeInteractions.delete(threadId)
       const errorMessage = event.properties?.error?.data?.message || 'Unknown error'
       try {
