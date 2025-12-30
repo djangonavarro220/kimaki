@@ -1066,38 +1066,59 @@ export function splitMarkdownForDiscord({
   let currentLang: string | null = null
 
   for (const line of lines) {
-    const wouldExceed = currentChunk.length + line.text.length > maxLength
+    if (line.isOpeningFence) {
+      currentLang = line.lang
+    }
 
-    if (wouldExceed && currentChunk) {
-      if (currentLang !== null) {
-        currentChunk += '```\n'
+    let textRemaining = line.text
+
+    while (textRemaining.length > 0) {
+      // Calculate available space, reserving room for a closing fence if needed
+      const closingOverhead = (currentLang !== null) ? 4 : 0 // \n```
+      const space = maxLength - currentChunk.length - closingOverhead
+
+      // If no space left (and not just an opening fence), flush
+      if (space <= 0) {
+         if (currentLang !== null) currentChunk += '\n```'
+         chunks.push(currentChunk)
+         currentChunk = ''
+         if (currentLang !== null) currentChunk += '```' + currentLang + '\n'
+         continue 
       }
-      chunks.push(currentChunk)
 
-      if (line.isClosingFence && currentLang !== null) {
-        currentChunk = ''
-        currentLang = null
-        continue
-      }
-
-      if (line.inCodeBlock || line.isOpeningFence) {
-        const lang = line.lang
-        currentChunk = '```' + lang + '\n'
-        if (!line.isOpeningFence) {
-          currentChunk += line.text
-        }
-        currentLang = lang
+      if (textRemaining.length <= space) {
+        currentChunk += textRemaining
+        textRemaining = ''
       } else {
-        currentChunk = line.text
-        currentLang = null
+        // Text is too long for current chunk.
+        // If current chunk is not "fresh" (has content beyond opening fence), flush it first.
+        const isFresh = currentChunk.length === 0 || (currentLang !== null && currentChunk === '```' + currentLang + '\n')
+        
+        if (!isFresh) {
+            if (currentLang !== null) currentChunk += '\n```'
+            chunks.push(currentChunk)
+            currentChunk = ''
+            if (currentLang !== null) currentChunk += '```' + currentLang + '\n'
+            continue
+        }
+
+        // Chunk is fresh but text is still too long -> Split the text
+        const slice = textRemaining.slice(0, space)
+        currentChunk += slice
+        textRemaining = textRemaining.slice(space)
+
+        // Close and push
+        if (currentLang !== null) currentChunk += '\n```'
+        chunks.push(currentChunk)
+
+        // Reopen for next part
+        currentChunk = ''
+        if (currentLang !== null) currentChunk += '```' + currentLang + '\n'
       }
-    } else {
-      currentChunk += line.text
-      if (line.inCodeBlock || line.isOpeningFence) {
-        currentLang = line.lang
-      } else if (line.isClosingFence) {
-        currentLang = null
-      }
+    }
+
+    if (line.isClosingFence) {
+      currentLang = null
     }
   }
 
