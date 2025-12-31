@@ -88,6 +88,13 @@ export class GlobalEventWatcher {
   // Accumulate assistant text deltas per message for final delivery
   private messageTextBuffers = new Map<string, string>()
 
+  // Accumulate reasoning deltas per part for component delivery
+  private reasoningBuffers = new Map<string, string>()
+  private messageReasoningParts = new Map<string, Set<string>>()
+
+  // Buffer tool input/output to emit one message per tool call
+  private toolBuffers = new Map<string, { tool: string; input?: any; output?: any; error?: any }>()
+
   constructor(port: number, deps: WatcherDependencies) {
     this.port = port
     this.deps = deps
@@ -402,18 +409,24 @@ export class GlobalEventWatcher {
         if (part.type === 'reasoning' && part.text) {
           formatted = formatPartForShadow('reasoning', part.text)
         } else if (part.type === 'tool' && part.state) {
-          if (part.state.status === 'running' && part.state.input) {
-            formatted = formatPartForShadow('tool-input', { tool: part.tool, input: part.state.input })
-          } else if (part.state.status === 'completed') {
-            formatted = formatPartForShadow('tool-output', { tool: part.tool, output: part.state.output })
-          } else if (part.state.status === 'error') {
-            formatted = formatPartForShadow('tool-error', { error: part.state.error })
+          let toolContent = ''
+          if (part.state.input) {
+            toolContent += formatPartForShadow('tool-input', { tool: part.tool, input: part.state.input })
           }
+          if (part.state.status === 'completed') {
+            toolContent += formatPartForShadow('tool-output', {
+              tool: part.tool,
+              output: this.summarizeToolOutput(part.tool, part.state.output),
+            })
+          } else if (part.state.status === 'error') {
+            toolContent += formatPartForShadow('tool-error', { error: part.state.error })
+          }
+          formatted = toolContent
         } else if (part.type === 'patch') {
           const diffText = (part as any).diff || (part as any).text
           if (diffText) formatted = formatPartForShadow('diff', diffText)
         } else if (part.type === 'text' && part.text) {
-          formatted = formatPartForShadow('text', part.text)
+          formatted = formatPartForShadow('final', part.text)
         }
 
         if (!formatted.trim()) continue
@@ -431,7 +444,7 @@ export class GlobalEventWatcher {
         if (backfillShadowThreadId) this.shadowThreadIds.set(messageId, backfillShadowThreadId)
         backfillMessageIds.add(messageId)
 
-        backfillRouter.append(formatted)
+        await backfillRouter.sendComponent(formatted)
         interactionSentAny = true
 
         // Record as sent to avoid duplicate backfills
@@ -495,6 +508,108 @@ export class GlobalEventWatcher {
       watcherLogger.log(`Thread ${threadId} not found, marking as unavailable`)
     }
     return null
+  }
+
+  /**
+   * Flush reasoning components for a message
+   */
+  private async flushReasoningComponents(messageId: string, router: ShadowStreamRouter): Promise<void> {
+    const parts = this.messageReasoningParts.get(messageId)
+    if (!parts || parts.size === 0) return
+
+    for (const partId of parts) {
+      const text = this.reasoningBuffers.get(partId) || ''
+      if (text.trim()) {
+        await router.sendComponent(formatPartForShadow('reasoning', text))
+      }
+      this.reasoningBuffers.delete(partId)
+    }
+
+    this.messageReasoningParts.delete(messageId)
+  }
+
+  private buildPreview(text: string, maxLines = 12, maxChars = 400): string {
+    const lines = text.split('\n')
+    let preview = lines.slice(0, maxLines).join('\n')
+
+    if (preview.length > maxChars) {
+      preview = preview.slice(0, maxChars) + '…'
+    }
+
+    if (lines.length > maxLines) {
+      preview += '\n…'
+    }
+
+    return preview
+  }
+
+  private summarizeToolOutput(toolName: string, output: any): { summary: string; preview?: string } {
+    const maxPreviewChars = 400
+    const maxPreviewLines = 12
+
+    if (toolName === 'webfetch') {
+      const url = output?.url || output?.request?.url || ''
+      const content = output?.content || output?.text || output?.html || ''
+      const length = typeof content === 'string' ? content.length : 0
+      const summary = url
+        ? `Fetched ${url} (${length ? length.toLocaleString() + ' chars' : 'no content'})`
+        : `Fetched content (${length.toLocaleString()} chars)`
+      return { summary }
+    }
+
+    if (toolName === 'bash') {
+      if (output && typeof output === 'object') {
+        const stdout = output.stdout || ''
+        const stderr = output.stderr || ''
+        const code = output.code ?? output.exitCode ?? output.status ?? output.signal ?? 'unknown'
+        const summary = `Exit ${code} • stdout ${String(stdout).length.toLocaleString()} chars • stderr ${String(stderr).length.toLocaleString()} chars`
+        const previewSource = stderr || stdout
+        const preview = (previewSource && String(previewSource).length <= maxPreviewChars)
+          ? this.buildPreview(String(previewSource), maxPreviewLines, maxPreviewChars)
+          : undefined
+        return { summary, preview }
+      }
+    }
+
+    let text = ''
+    if (typeof output === 'string') {
+      text = output
+    } else {
+      try {
+        text = JSON.stringify(output, null, 2)
+      } catch {
+        text = String(output)
+      }
+    }
+
+    const summary = `Output ${text.length.toLocaleString()} chars`
+    const preview = text.length <= maxPreviewChars
+      ? this.buildPreview(text, maxPreviewLines, maxPreviewChars)
+      : undefined
+
+    return { summary, preview }
+  }
+
+  private async flushToolComponent(partId: string, router: ShadowStreamRouter): Promise<void> {
+    const buffer = this.toolBuffers.get(partId)
+    if (!buffer) return
+
+    let content = ''
+    if (buffer.input) {
+      content += formatPartForShadow('tool-input', { tool: buffer.tool, input: buffer.input })
+    }
+    if (buffer.output) {
+      content += formatPartForShadow('tool-output', { tool: buffer.tool, output: buffer.output })
+    }
+    if (buffer.error) {
+      content += formatPartForShadow('tool-error', { error: buffer.error })
+    }
+
+    if (content.trim()) {
+      await router.sendComponent(content)
+    }
+
+    this.toolBuffers.delete(partId)
   }
 
   /**
@@ -597,6 +712,8 @@ export class GlobalEventWatcher {
           const lastId = this.lastCompletedMessageIds.get(sessionId)
           if (lastId !== msg.id) {
             this.lastCompletedMessageIds.set(sessionId, msg.id)
+
+            this.stopTyping(threadId)
             
             // 1. Send Final Text to MAIN thread (clean)
             const textParts = (msg.parts || [])
@@ -622,6 +739,19 @@ export class GlobalEventWatcher {
             const activeInteraction = this.activeInteractions.get(thread.id)
             
             if (router) {
+                await this.flushReasoningComponents(msg.id, router)
+                if (activeInteraction) {
+                    for (const mid of activeInteraction.messageIds) {
+                        if (mid !== msg.id) {
+                            await this.flushReasoningComponents(mid, router)
+                        }
+                    }
+                }
+
+                if (finalText.trim()) {
+                    await router.sendComponent(finalText)
+                }
+
                 await router.end()
                 
                 // Cleanup all mappings for this interaction
@@ -699,7 +829,12 @@ export class GlobalEventWatcher {
              this.partOffsets.set(part.id, currentLen)
              
              if (delta) {
-                 router.append(formatPartForShadow('reasoning', delta))
+                 const previousText = this.reasoningBuffers.get(part.id) || ''
+                 this.reasoningBuffers.set(part.id, previousText + delta)
+
+                 const messageParts = this.messageReasoningParts.get(part.messageID) || new Set()
+                 messageParts.add(part.id)
+                 this.messageReasoningParts.set(part.messageID, messageParts)
              }
           }
           
@@ -711,7 +846,6 @@ export class GlobalEventWatcher {
              this.partOffsets.set(part.id, currentLen)
              
              if (delta) {
-                 router.append(delta) // Raw text append
                  const previousText = this.messageTextBuffers.get(part.messageID) || ''
                  this.messageTextBuffers.set(part.messageID, previousText + delta)
              }
@@ -722,21 +856,29 @@ export class GlobalEventWatcher {
              const statuses = this.partStatuses.get(part.id) || new Set()
              
              if (part.state.status === 'running' && part.state.input && !statuses.has('input')) {
-                 router.append(formatPartForShadow('tool-input', { tool: part.tool, input: part.state.input }))
+                 const buffer = this.toolBuffers.get(part.id) || { tool: part.tool }
+                 buffer.input = part.state.input
+                 this.toolBuffers.set(part.id, buffer)
                  statuses.add('input')
                  this.partStatuses.set(part.id, statuses)
              }
              
              if (part.state.status === 'completed' && !statuses.has('output')) {
-                 router.append(formatPartForShadow('tool-output', { tool: part.tool, output: part.state.output }))
+                 const buffer = this.toolBuffers.get(part.id) || { tool: part.tool }
+                 buffer.output = this.summarizeToolOutput(part.tool, part.state.output)
+                 this.toolBuffers.set(part.id, buffer)
                  statuses.add('output')
                  this.partStatuses.set(part.id, statuses)
+                 await this.flushToolComponent(part.id, router)
              }
              
              if (part.state.status === 'error' && !statuses.has('error')) {
-                 router.append(formatPartForShadow('tool-error', { error: part.state.error }))
+                 const buffer = this.toolBuffers.get(part.id) || { tool: part.tool }
+                 buffer.error = part.state.error
+                 this.toolBuffers.set(part.id, buffer)
                  statuses.add('error')
                  this.partStatuses.set(part.id, statuses)
+                 await this.flushToolComponent(part.id, router)
              }
           }
           
@@ -745,18 +887,19 @@ export class GlobalEventWatcher {
               const diffText = (part as any).diff || (part as any).text
               const statuses = this.partStatuses.get(part.id) || new Set()
               
-              if (diffText && !statuses.has('diff')) {
-                  router.append(formatPartForShadow('diff', diffText))
-                  statuses.add('diff')
-                  this.partStatuses.set(part.id, statuses)
-              }
+               if (diffText && !statuses.has('diff')) {
+                   await router.sendComponent(formatPartForShadow('diff', diffText))
+                   statuses.add('diff')
+                   this.partStatuses.set(part.id, statuses)
+               }
+
           }
 
           // Typing indicator logic
           if (part.type === 'step-start') {
             this.startTyping(threadId, thread)
           } else if (part.type === 'step-finish') {
-            this.stopTyping(threadId)
+            await this.flushReasoningComponents(part.messageID, router)
           }
       }
 
@@ -767,6 +910,13 @@ export class GlobalEventWatcher {
       if (activeInteraction) {
         for (const mid of activeInteraction.messageIds) {
           this.messageTextBuffers.delete(mid)
+          const parts = this.messageReasoningParts.get(mid)
+          if (parts) {
+            for (const partId of parts) {
+              this.reasoningBuffers.delete(partId)
+            }
+            this.messageReasoningParts.delete(mid)
+          }
         }
       }
       this.activeInteractions.delete(threadId)
@@ -776,6 +926,13 @@ export class GlobalEventWatcher {
       if (activeInteraction) {
         for (const mid of activeInteraction.messageIds) {
           this.messageTextBuffers.delete(mid)
+          const parts = this.messageReasoningParts.get(mid)
+          if (parts) {
+            for (const partId of parts) {
+              this.reasoningBuffers.delete(partId)
+            }
+            this.messageReasoningParts.delete(mid)
+          }
         }
       }
       this.activeInteractions.delete(threadId)

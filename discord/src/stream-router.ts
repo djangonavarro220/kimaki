@@ -21,6 +21,23 @@ export class ShadowStreamRouter {
     this.buffer += text + '\n'
     this.tryFlush().catch(err => console.error('Error in auto-flush:', err))
   }
+
+  /**
+   * Send a complete component as its own message (no streaming).
+   */
+  async sendComponent(text: string) {
+    if (!text || !text.trim()) return
+    await this.flush()
+
+    try {
+      const chunks = splitDiscordMessage(text)
+      for (const chunk of chunks) {
+        await this.thread.send(chunk)
+      }
+    } catch (e) {
+      console.error('Shadow thread component send error:', e)
+    }
+  }
   
   private async tryFlush() {
     if (this.isFlushing) return

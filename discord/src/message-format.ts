@@ -10,9 +10,15 @@ export const ICONS = {
   ERROR: '❌',
 }
 
+function escapeFenceContent(text: string): string {
+  // Prevent accidental closing of code fences
+  return text.replace(/```/g, '\\`\\`\\`')
+}
+
 export function formatReasoning(text: string): string {
   // Use blockquote for reasoning
-  return `\n${ICONS.THINK} **Reasoning**\n>>> ${text.replace(/\n/g, '\n> ')}\n`
+  const safeText = escapeFenceContent(text)
+  return `\n${ICONS.THINK} **Reasoning**\n>>> ${safeText.replace(/\n/g, '\n> ')}\n`
 }
 
 export function formatToolCall(toolName: string, input: any): string {
@@ -20,9 +26,10 @@ export function formatToolCall(toolName: string, input: any): string {
   
   if (input) {
     const inputStr = typeof input === 'string' ? input : JSON.stringify(input, null, 2)
+    const safeInput = escapeFenceContent(inputStr)
     // If bash, use bash highlighting
     const lang = toolName === 'bash' ? 'bash' : 'json'
-    content += `\n\`\`\`${lang}\n${inputStr}\n\`\`\``
+    content += `\n\`\`\`${lang}\n${safeInput}\n\`\`\``
   }
   return content
 }
@@ -30,22 +37,35 @@ export function formatToolCall(toolName: string, input: any): string {
 export function formatToolResult(toolName: string, output: any): string {
   let content = `\n${ICONS.TOOL} **Result** (\`${toolName}\`)`
   if (output) {
+    if (typeof output === 'object' && output.summary) {
+      content += `\n${output.summary}`
+      if (output.preview) {
+        const safePreview = escapeFenceContent(String(output.preview))
+        content += `\n\`\`\`\n${safePreview}\n\`\`\``
+      }
+      return content
+    }
+
     const outputStr = typeof output === 'string' ? output : JSON.stringify(output, null, 2)
-    content += `\n\`\`\`\n${outputStr}\n\`\`\``
+    const safeOutput = escapeFenceContent(outputStr)
+    content += `\n\`\`\`\n${safeOutput}\n\`\`\``
   }
   return content
 }
 
 export function formatDiff(diffText: string): string {
-  return `\n${ICONS.DIFF} **Diff**\n\`\`\`diff\n${diffText}\n\`\`\``
+  const safeDiff = escapeFenceContent(diffText)
+  return `\n${ICONS.DIFF} **Diff**\n\`\`\`diff\n${safeDiff}\n\`\`\``
 }
 
 export function formatFinalAnswer(text: string): string {
-  return `\n${ICONS.FINAL} **Final Answer**\n${text}`
+  const safeText = escapeFenceContent(text)
+  return `\n${ICONS.FINAL} **Final Answer**\n${safeText}`
 }
 
 export function formatError(error: string): string {
-  return `\n${ICONS.ERROR} **Error**\n\`\`\`\n${error}\n\`\`\``
+  const safeError = escapeFenceContent(error)
+  return `\n${ICONS.ERROR} **Error**\n\`\`\`\n${safeError}\n\`\`\``
 }
 
 export function formatPartForShadow(type: string, content: any): string {
