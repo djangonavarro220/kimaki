@@ -2521,15 +2521,23 @@ export async function startDiscordBot({
                 channel.type === ChannelType.PrivateThread ||
                 channel.type === ChannelType.AnnouncementThread
               ) {
-                const textChannel = resolveTextChannel(channel as ThreadChannel)
-                if (textChannel) {
-                  const { projectDirectory: directory, channelAppId } =
-                    getKimakiMetadata(textChannel)
-                  if (channelAppId && channelAppId !== currentAppId) {
-                    await interaction.respond([])
-                    return
+                const threadRow = getDatabase()
+                  .prepare('SELECT directory FROM thread_directories WHERE thread_id = ?')
+                  .get(channel.id) as { directory: string } | undefined
+
+                if (threadRow?.directory) {
+                  projectDirectory = threadRow.directory
+                } else {
+                  const textChannel = resolveTextChannel(channel as ThreadChannel)
+                  if (textChannel) {
+                    const { projectDirectory: directory, channelAppId } =
+                      getKimakiMetadata(textChannel)
+                    if (channelAppId && channelAppId !== currentAppId) {
+                      await interaction.respond([])
+                      return
+                    }
+                    projectDirectory = directory
                   }
-                  projectDirectory = directory
                 }
               }
             }
