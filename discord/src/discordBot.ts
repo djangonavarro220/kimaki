@@ -52,6 +52,12 @@ import type { Session } from '@google/genai'
 import { createLogger } from './logger.js'
 import { isAbortError } from './utils.js'
 import { GlobalEventWatcher, type WatcherDependencies } from './global-event-watcher.js'
+import {
+  buildThreadTitle,
+  consumePendingThreadRename,
+  markThreadRename,
+  normalizeTitle,
+} from './thread-title-sync.js'
 import { setGlobalDispatcher, Agent } from 'undici'
 // disables the automatic 5 minutes abort after no body
 setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0 }))
@@ -75,6 +81,12 @@ function parseSlashCommand(text: string): ParsedCommand {
   const command = match[1]!
   const args = match[2]?.trim() || ''
   return { isCommand: true, command, arguments: args }
+}
+
+function parseBooleanEnv(value?: string): boolean {
+  if (!value) return false
+  const normalized = value.trim().toLowerCase()
+  return ['1', 'true', 'yes', 'on'].includes(normalized)
 }
 
 export function getOpencodeSystemMessage({ sessionId }: { sessionId: string }) {
@@ -1858,8 +1870,18 @@ export async function startDiscordBot({
         sendThreadMessage,
         formatPart,
       }
-      
-      globalEventWatcher = new GlobalEventWatcher(externalPort, watcherDeps)
+
+      const autoResumeNewSessions = parseBooleanEnv(
+        process.env.KIMAKI_AUTO_RESUME_SESSIONS,
+      )
+
+      if (autoResumeNewSessions) {
+        discordLogger.log('[SYNC] Auto-resume new sessions is enabled')
+      }
+
+      globalEventWatcher = new GlobalEventWatcher(externalPort, watcherDeps, {
+        autoResumeNewSessions,
+      })
       await globalEventWatcher.start()
       discordLogger.log(`[SYNC] GlobalEventWatcher started successfully`)
     } else {
@@ -1925,6 +1947,81 @@ export async function startDiscordBot({
     // Authoritative Sync: Initialize watcher (only if not already done)
     if (!globalEventWatcher) {
       await initializeSyncWatcher(c)
+    }
+  })
+
+  discordClient.on(Events.ThreadUpdate, async (oldThread, newThread) => {
+    try {
+      if (oldThread.name === newThread.name) return
+
+      if (consumePendingThreadRename(newThread.id, newThread.name)) {
+        return
+      }
+
+      const textChannel = resolveTextChannel(newThread)
+      if (!textChannel) return
+
+      const { projectDirectory, channelAppId } = getKimakiMetadata(textChannel)
+      if (channelAppId && channelAppId !== currentAppId) {
+        return
+      }
+
+      const sessionRow = getDatabase()
+        .prepare('SELECT session_id FROM thread_sessions WHERE thread_id = ?')
+        .get(newThread.id) as { session_id: string } | undefined
+
+      if (!sessionRow?.session_id) return
+
+      const directoryRow = getDatabase()
+        .prepare('SELECT directory FROM thread_directories WHERE thread_id = ?')
+        .get(newThread.id) as { directory: string } | undefined
+
+      const directory = directoryRow?.directory || projectDirectory
+      if (!directory) {
+        discordLogger.log(
+          `[SYNC] No directory found for thread ${newThread.id}, skipping title sync`,
+        )
+        return
+      }
+
+      const getClient = await initializeOpencodeForDirectory(directory)
+      const sessionResponse = await getClient().session.get({
+        path: { id: sessionRow.session_id },
+      })
+
+      const sessionTitle = sessionResponse.data?.title || ''
+      const normalizedSessionTitle = normalizeTitle(sessionTitle)
+      const normalizedOldName = normalizeTitle(oldThread.name)
+      const normalizedNewName = normalizeTitle(newThread.name)
+
+      if (!normalizedNewName) return
+
+      if (normalizedSessionTitle === normalizedNewName) {
+        return
+      }
+
+      if (normalizedSessionTitle !== normalizedOldName) {
+        const desiredName = buildThreadTitle(sessionTitle)
+        if (normalizeTitle(desiredName) !== normalizedNewName) {
+          markThreadRename(newThread.id, desiredName)
+          await newThread.setName(desiredName)
+          discordLogger.log(
+            `[SYNC] Reverted thread name to session title: "${desiredName}"`,
+          )
+        }
+        return
+      }
+
+      await getClient().session.update({
+        path: { id: sessionRow.session_id },
+        body: { title: normalizedNewName },
+      })
+
+      discordLogger.log(
+        `[SYNC] Updated session title ${sessionRow.session_id} -> "${normalizedNewName}"`,
+      )
+    } catch (error) {
+      discordLogger.log('[SYNC] Thread title sync failed:', error)
     }
   })
 

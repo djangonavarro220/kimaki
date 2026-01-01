@@ -10,7 +10,13 @@ import {
   type OpencodeClient,
   type Part,
 } from '@opencode-ai/sdk'
-import type { Client as DiscordClient, ThreadChannel, Message, TextChannel } from 'discord.js'
+import {
+  type Client as DiscordClient,
+  ThreadAutoArchiveDuration,
+  ThreadChannel,
+  type Message,
+  type TextChannel,
+} from 'discord.js'
 import type Database from 'better-sqlite3'
 import prettyMilliseconds from 'pretty-ms'
 import { createLogger } from './logger.js'
@@ -18,6 +24,7 @@ import { getOrCreateShadowChannel, createShadowThread, buildThreadLink } from '.
 import { ShadowStreamRouter } from './stream-router.js'
 import { formatPartForShadow } from './message-format.js'
 import { splitDiscordMessage } from './chunking.js'
+import { buildThreadTitle, markThreadRename } from './thread-title-sync.js'
 
 const watcherLogger = createLogger('WATCHER')
 
@@ -26,6 +33,10 @@ export interface WatcherDependencies {
   getDiscordClient: () => DiscordClient
   sendThreadMessage: (thread: ThreadChannel, content: string) => Promise<Message>
   formatPart: (part: Part) => string
+}
+
+export interface WatcherOptions {
+  autoResumeNewSessions?: boolean
 }
 
 interface ThreadSession {
@@ -95,9 +106,15 @@ export class GlobalEventWatcher {
   // Buffer tool input/output to emit one message per tool call
   private toolBuffers = new Map<string, { tool: string; input?: any; output?: any; error?: any }>()
 
-  constructor(port: number, deps: WatcherDependencies) {
+  private autoResumeNewSessions: boolean
+  private autoResumeSince: number
+  private autoResumeTimers = new Map<string, NodeJS.Timeout>()
+
+  constructor(port: number, deps: WatcherDependencies, options: WatcherOptions = {}) {
     this.port = port
     this.deps = deps
+    this.autoResumeNewSessions = options.autoResumeNewSessions ?? false
+    this.autoResumeSince = Date.now()
   }
 
   /**
@@ -369,25 +386,31 @@ export class GlobalEventWatcher {
    */
 
   private async backfillSession(sessionId: string, threadId: string): Promise<void> {
-    if (!this.client) return
-
     // Skip sessions that are actively streaming - their parts may be incomplete
     if (this.sessionParts.has(sessionId)) {
+      watcherLogger.log(`Skipping backfill for active session ${sessionId}`)
       return
     }
 
+    if (!this.client) return
+
+    // Get thread
+    const thread = await this.getThread(threadId)
+    if (!thread) return
+
+    await this.syncThreadTitleFromSession(sessionId, thread)
+
+    // Get session messages from API
     const messagesResponse = await this.client.session.messages({
       path: { id: sessionId },
     })
 
-    if (!messagesResponse.data) {
+    if (!messagesResponse.data || messagesResponse.data.length === 0) {
       watcherLogger.log(`No messages found for session ${sessionId}`)
       return
     }
 
     const messages = messagesResponse.data
-    const thread = await this.getThread(threadId)
-    if (!thread) return
 
     let backfilledCount = 0
     let backfillRouter: ShadowStreamRouter | null = null
@@ -499,21 +522,118 @@ export class GlobalEventWatcher {
 
     try {
       const channel = await this.deps.getDiscordClient().channels.fetch(threadId)
-      if (channel?.isThread()) {
-        return channel as ThreadChannel
+      if (!channel || !(channel instanceof ThreadChannel)) {
+        throw new Error('Not a thread')
       }
+      return channel
     } catch (e) {
-      // Cache the failure to avoid repeated API calls
       this.failedThreads.add(threadId)
       watcherLogger.log(`Thread ${threadId} not found, marking as unavailable`)
+      return null
     }
-    return null
+  }
+
+  private async syncThreadTitleFromSession(sessionId: string, thread: ThreadChannel): Promise<void> {
+    if (!this.client) return
+
+    try {
+      const sessionResponse = await this.client.session.get({
+        path: { id: sessionId },
+      })
+
+      const title = sessionResponse.data?.title || ''
+      const desiredName = buildThreadTitle(title)
+      if (!desiredName || thread.name === desiredName) return
+
+      markThreadRename(thread.id, desiredName)
+      await thread.setName(desiredName)
+      watcherLogger.log(`Synced thread name to session title: "${desiredName}"`)
+    } catch (e) {
+      watcherLogger.error(`Failed to sync thread title for ${thread.id}:`, e)
+    }
+  }
+
+  private scheduleAutoResume(info: any): void {
+    const sessionId = info?.id
+    const directory = info?.directory
+
+    if (!sessionId || !directory) return
+    if (this.autoResumeSince && info?.time?.created && info.time.created < this.autoResumeSince) {
+      return
+    }
+
+    if (this.autoResumeTimers.has(sessionId)) return
+
+    const timeout = setTimeout(() => {
+      this.autoResumeTimers.delete(sessionId)
+      this.autoResumeSession(info).catch((error) => {
+        watcherLogger.error(`[SYNC] Auto-resume failed for ${sessionId}:`, error)
+      })
+    }, 2000)
+
+    this.autoResumeTimers.set(sessionId, timeout)
+  }
+
+  private async autoResumeSession(info: any): Promise<void> {
+    if (!this.client) return
+
+    const sessionId = info?.id
+    const directory = info?.directory
+
+    if (!sessionId || !directory) return
+
+    const db = this.deps.getDatabase()
+    const existing = db
+      .prepare('SELECT thread_id FROM thread_sessions WHERE session_id = ?')
+      .get(sessionId) as { thread_id: string } | undefined
+
+    if (existing?.thread_id) return
+
+    const channelRow = db
+      .prepare('SELECT channel_id FROM channel_directories WHERE directory = ? AND channel_type = ?')
+      .get(directory, 'text') as { channel_id: string } | undefined
+
+    if (!channelRow?.channel_id) {
+      watcherLogger.log(`[SYNC] No channel found for directory ${directory}, skipping auto-resume`)
+      return
+    }
+
+    const channel = await this.deps.getDiscordClient().channels.fetch(channelRow.channel_id)
+
+    if (!channel || !channel.isTextBased() || !('threads' in channel)) {
+      watcherLogger.log(`[SYNC] Channel ${channelRow.channel_id} not available for threads`)
+      return
+    }
+
+    const textChannel = channel as TextChannel
+    const desiredName = buildThreadTitle(info?.title || '')
+    const thread = await textChannel.threads.create({
+      name: desiredName,
+      autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+      reason: `Auto-resume session ${sessionId}`,
+    })
+
+    db.prepare(
+      'INSERT OR REPLACE INTO thread_sessions (thread_id, session_id) VALUES (?, ?)',
+    ).run(thread.id, sessionId)
+
+    db.prepare(
+      'INSERT OR REPLACE INTO thread_directories (thread_id, directory) VALUES (?, ?)',
+    ).run(thread.id, directory)
+
+    await this.deps.sendThreadMessage(
+      thread,
+      `Session created: ${desiredName}`,
+    )
+
+    watcherLogger.log(`[SYNC] Auto-resumed session ${sessionId} in thread ${thread.id}`)
   }
 
   /**
    * Flush reasoning components for a message
    */
   private async flushReasoningComponents(messageId: string, router: ShadowStreamRouter): Promise<void> {
+
     const parts = this.messageReasoningParts.get(messageId)
     if (!parts || parts.size === 0) return
 
@@ -690,17 +810,41 @@ export class GlobalEventWatcher {
    */
   private async handleEvent(event: any): Promise<void> {
     const sessionId = event.properties?.info?.sessionID 
+      || event.properties?.info?.id
       || event.properties?.part?.sessionID
       || event.properties?.sessionID
 
     if (!sessionId) return
 
+    const info = event.properties?.info
+
     // Check if this session is linked to a Discord thread
     const threadId = this.getThreadForSession(sessionId)
+
+    if (event.type === 'session.created' && this.autoResumeNewSessions && !threadId && info) {
+      this.scheduleAutoResume(info)
+    }
+
     if (!threadId) return
 
     const thread = await this.getThread(threadId)
     if (!thread) return
+
+    if (event.type === 'session.updated' || event.type === 'session.created') {
+      const title = info?.title || ''
+      const desiredName = buildThreadTitle(title)
+
+      if (desiredName && thread.name !== desiredName) {
+        try {
+          markThreadRename(thread.id, desiredName)
+          await thread.setName(desiredName)
+          watcherLogger.log(`Synced thread name to session title: "${desiredName}"`)
+        } catch (e) {
+          watcherLogger.error(`Failed to sync thread name for ${thread.id}:`, e)
+        }
+      }
+      return
+    }
 
     if (event.type === 'message.updated') {
       const msg = event.properties.info
