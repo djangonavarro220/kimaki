@@ -83,6 +83,12 @@ function parseSlashCommand(text: string): ParsedCommand {
   return { isCommand: true, command, arguments: args }
 }
 
+function parseBooleanEnv(value?: string): boolean {
+  if (!value) return false
+  const normalized = value.trim().toLowerCase()
+  return ['1', 'true', 'yes', 'on'].includes(normalized)
+}
+
 export function getOpencodeSystemMessage({ sessionId }: { sessionId: string }) {
   return `
 The user is reading your messages from inside Discord, via kimaki.xyz
@@ -1864,8 +1870,18 @@ export async function startDiscordBot({
         sendThreadMessage,
         formatPart,
       }
-      
-      globalEventWatcher = new GlobalEventWatcher(externalPort, watcherDeps)
+
+      const autoResumeNewSessions = parseBooleanEnv(
+        process.env.KIMAKI_AUTO_RESUME_SESSIONS,
+      )
+
+      if (autoResumeNewSessions) {
+        discordLogger.log('[SYNC] Auto-resume new sessions is enabled')
+      }
+
+      globalEventWatcher = new GlobalEventWatcher(externalPort, watcherDeps, {
+        autoResumeNewSessions,
+      })
       await globalEventWatcher.start()
       discordLogger.log(`[SYNC] GlobalEventWatcher started successfully`)
     } else {

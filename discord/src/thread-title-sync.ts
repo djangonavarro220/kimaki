@@ -15,8 +15,9 @@ export function normalizeTitle(title: string): string {
 
 export function truncateTitle(title: string, maxLength = THREAD_TITLE_MAX): string {
   if (title.length <= maxLength) return title
-  const sliceLength = Math.max(0, maxLength - 1)
-  return title.slice(0, sliceLength) + '…'
+  const ellipsis = '...'
+  const sliceLength = Math.max(0, maxLength - ellipsis.length)
+  return title.slice(0, sliceLength) + ellipsis
 }
 
 export function buildThreadTitle(sessionTitle?: string | null, maxLength = THREAD_TITLE_MAX): string {
