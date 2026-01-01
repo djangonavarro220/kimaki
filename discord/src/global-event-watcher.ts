@@ -10,7 +10,7 @@ import {
   type OpencodeClient,
   type Part,
 } from '@opencode-ai/sdk'
-import type { Client as DiscordClient, ThreadChannel, Message, TextChannel } from 'discord.js'
+import { type Client as DiscordClient, ThreadChannel, type Message, type TextChannel } from 'discord.js'
 import type Database from 'better-sqlite3'
 import prettyMilliseconds from 'pretty-ms'
 import { createLogger } from './logger.js'
@@ -18,6 +18,7 @@ import { getOrCreateShadowChannel, createShadowThread, buildThreadLink } from '.
 import { ShadowStreamRouter } from './stream-router.js'
 import { formatPartForShadow } from './message-format.js'
 import { splitDiscordMessage } from './chunking.js'
+import { buildThreadTitle, markThreadRename } from './thread-title-sync.js'
 
 const watcherLogger = createLogger('WATCHER')
 
@@ -369,25 +370,31 @@ export class GlobalEventWatcher {
    */
 
   private async backfillSession(sessionId: string, threadId: string): Promise<void> {
-    if (!this.client) return
-
     // Skip sessions that are actively streaming - their parts may be incomplete
     if (this.sessionParts.has(sessionId)) {
+      watcherLogger.log(`Skipping backfill for active session ${sessionId}`)
       return
     }
 
+    if (!this.client) return
+
+    // Get thread
+    const thread = await this.getThread(threadId)
+    if (!thread) return
+
+    await this.syncThreadTitleFromSession(sessionId, thread)
+
+    // Get session messages from API
     const messagesResponse = await this.client.session.messages({
       path: { id: sessionId },
     })
 
-    if (!messagesResponse.data) {
+    if (!messagesResponse.data || messagesResponse.data.length === 0) {
       watcherLogger.log(`No messages found for session ${sessionId}`)
       return
     }
 
     const messages = messagesResponse.data
-    const thread = await this.getThread(threadId)
-    if (!thread) return
 
     let backfilledCount = 0
     let backfillRouter: ShadowStreamRouter | null = null
@@ -499,16 +506,37 @@ export class GlobalEventWatcher {
 
     try {
       const channel = await this.deps.getDiscordClient().channels.fetch(threadId)
-      if (channel?.isThread()) {
-        return channel as ThreadChannel
+      if (!channel || !(channel instanceof ThreadChannel)) {
+        throw new Error('Not a thread')
       }
+      return channel
     } catch (e) {
-      // Cache the failure to avoid repeated API calls
       this.failedThreads.add(threadId)
       watcherLogger.log(`Thread ${threadId} not found, marking as unavailable`)
+      return null
     }
-    return null
   }
+
+  private async syncThreadTitleFromSession(sessionId: string, thread: ThreadChannel): Promise<void> {
+    if (!this.client) return
+
+    try {
+      const sessionResponse = await this.client.session.get({
+        path: { id: sessionId },
+      })
+
+      const title = sessionResponse.data?.title || ''
+      const desiredName = buildThreadTitle(title)
+      if (!desiredName || thread.name === desiredName) return
+
+      markThreadRename(thread.id, desiredName)
+      await thread.setName(desiredName)
+      watcherLogger.log(`Synced thread name to session title: "${desiredName}"`)
+    } catch (e) {
+      watcherLogger.error(`Failed to sync thread title for ${thread.id}:`, e)
+    }
+  }
+
 
   /**
    * Flush reasoning components for a message
@@ -690,6 +718,7 @@ export class GlobalEventWatcher {
    */
   private async handleEvent(event: any): Promise<void> {
     const sessionId = event.properties?.info?.sessionID 
+      || event.properties?.info?.id
       || event.properties?.part?.sessionID
       || event.properties?.sessionID
 
@@ -701,6 +730,23 @@ export class GlobalEventWatcher {
 
     const thread = await this.getThread(threadId)
     if (!thread) return
+
+    if (event.type === 'session.updated' || event.type === 'session.created') {
+      const info = event.properties?.info
+      const title = info?.title || ''
+      const desiredName = buildThreadTitle(title)
+
+      if (desiredName && thread.name !== desiredName) {
+        try {
+          markThreadRename(thread.id, desiredName)
+          await thread.setName(desiredName)
+          watcherLogger.log(`Synced thread name to session title: "${desiredName}"`)
+        } catch (e) {
+          watcherLogger.error(`Failed to sync thread name for ${thread.id}:`, e)
+        }
+      }
+      return
+    }
 
     if (event.type === 'message.updated') {
       const msg = event.properties.info
