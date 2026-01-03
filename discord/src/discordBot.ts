@@ -1778,7 +1778,19 @@ async function handleOpencodeSession({
         discordLogger.log(`Could not update reaction:`, e)
       }
     }
-    
+
+    const errorMsg =
+      error instanceof Error ? error.stack || error.message : String(error)
+
+    // Handle connection errors gracefully
+    if (errorMsg.includes('fetch failed') || errorMsg.includes('ECONNRESET')) {
+      await sendThreadMessage(
+        thread,
+        `🔌 **Connection lost**: The OpenCode server is restarting or unreachable. Please try again in a few seconds.`,
+      )
+      return
+    }
+
     const errorName =
       error &&
       typeof error === 'object' &&
@@ -1787,8 +1799,7 @@ async function handleOpencodeSession({
       typeof error.constructor.name === 'string'
         ? error.constructor.name
         : typeof error
-    const errorMsg =
-      error instanceof Error ? error.stack || error.message : String(error)
+
     await sendThreadMessage(
       thread,
       `✗ Unexpected bot Error: [${errorName}]\n${errorMsg}`,
