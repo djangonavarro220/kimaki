@@ -1,6 +1,6 @@
 /**
  * GlobalEventWatcher - Persistent SSE subscription for Discord sync
- * 
+ *
  * This class maintains a single SSE connection to the OpenCode server
  * and routes events to Discord threads based on session-to-thread mappings.
  */
@@ -20,7 +20,11 @@ import {
 import type Database from 'better-sqlite3'
 import prettyMilliseconds from 'pretty-ms'
 import { createLogger } from './logger.js'
-import { getOrCreateShadowChannel, createShadowThread, buildThreadLink } from './shadow-threads.js'
+import {
+  getOrCreateShadowChannel,
+  createShadowThread,
+  buildThreadLink,
+} from './shadow-threads.js'
 import { ShadowStreamRouter } from './stream-router.js'
 import { formatPartForShadow } from './message-format.js'
 import { splitDiscordMessage } from './chunking.js'
@@ -31,7 +35,10 @@ const watcherLogger = createLogger('WATCHER')
 export interface WatcherDependencies {
   getDatabase: () => Database.Database
   getDiscordClient: () => DiscordClient
-  sendThreadMessage: (thread: ThreadChannel, content: string) => Promise<Message>
+  sendThreadMessage: (
+    thread: ThreadChannel,
+    content: string,
+  ) => Promise<Message>
   formatPart: (part: Part) => string
 }
 
@@ -61,7 +68,7 @@ export class GlobalEventWatcher {
 
   // Track active typing per thread
   private typingIntervals = new Map<string, NodeJS.Timeout>()
-  
+
   // Track accumulated parts per session
   private sessionParts = new Map<string, Part[]>()
 
@@ -77,10 +84,6 @@ export class GlobalEventWatcher {
   // Cache for threads that failed to fetch (avoid repeated API calls)
   private failedThreads = new Set<string>()
 
-  // Periodic backfill interval
-  private backfillInterval: NodeJS.Timeout | null = null
-  private static BACKFILL_INTERVAL_MS = 30000 // 30 seconds
-
   // Shadow thread management
   private shadowRouters = new Map<string, ShadowStreamRouter>() // messageId -> router
   private partOffsets = new Map<string, number>() // partId -> length sent
@@ -89,12 +92,15 @@ export class GlobalEventWatcher {
   private partStatuses = new Map<string, Set<string>>() // partId -> set of sent states ('input', 'output')
 
   // Track active interaction per thread (to reuse shadow thread across multiple assistant messages in one turn)
-  private activeInteractions = new Map<string, {
-    router: ShadowStreamRouter
-    statusMessage: Message
-    shadowThreadId: string
-    messageIds: Set<string> // Track all message IDs associated with this interaction for cleanup
-  }>()
+  private activeInteractions = new Map<
+    string,
+    {
+      router: ShadowStreamRouter
+      statusMessage: Message
+      shadowThreadId: string
+      messageIds: Set<string> // Track all message IDs associated with this interaction for cleanup
+    }
+  >()
 
   // Accumulate assistant text deltas per message for final delivery
   private messageTextBuffers = new Map<string, string>()
@@ -104,13 +110,20 @@ export class GlobalEventWatcher {
   private messageReasoningParts = new Map<string, Set<string>>()
 
   // Buffer tool input/output to emit one message per tool call
-  private toolBuffers = new Map<string, { tool: string; input?: any; output?: any; error?: any }>()
+  private toolBuffers = new Map<
+    string,
+    { tool: string; input?: any; output?: any; error?: any }
+  >()
 
   private autoResumeNewSessions: boolean
   private autoResumeSince: number
   private autoResumeTimers = new Map<string, NodeJS.Timeout>()
 
-  constructor(port: number, deps: WatcherDependencies, options: WatcherOptions = {}) {
+  constructor(
+    port: number,
+    deps: WatcherDependencies,
+    options: WatcherOptions = {},
+  ) {
     this.port = port
     this.deps = deps
     this.autoResumeNewSessions = options.autoResumeNewSessions ?? false
@@ -140,32 +153,35 @@ export class GlobalEventWatcher {
       if (activeInteraction.statusMessage) {
         this.statusMessages.set(messageId, activeInteraction.statusMessage)
       }
-      
+
       // Track this message ID for later cleanup
       if (trackInteraction) {
         activeInteraction.messageIds.add(messageId)
       }
-      
+
       return activeInteraction.router
     }
 
     // Determine parent channel
     const parentChannel = originThread.parent as TextChannel | null
     if (!parentChannel) {
-        // Can happen if thread is in guild root? Unlikely for TextChannel threads.
-        // Or if cached data is incomplete.
-        // Try fetching
-        try {
-           await originThread.fetch()
-        } catch {}
-        if (!originThread.parent) {
-           watcherLogger.error(`Thread ${originThread.id} has no parent channel`)
-           return null
-        }
+      // Can happen if thread is in guild root? Unlikely for TextChannel threads.
+      // Or if cached data is incomplete.
+      // Try fetching
+      try {
+        await originThread.fetch()
+      } catch {}
+      if (!originThread.parent) {
+        watcherLogger.error(`Thread ${originThread.id} has no parent channel`)
+        return null
+      }
     }
 
     // Get/Create Shadow Channel
-    const shadowChannel = await getOrCreateShadowChannel(originThread.guild, parentChannel as TextChannel)
+    const shadowChannel = await getOrCreateShadowChannel(
+      originThread.guild,
+      parentChannel as TextChannel,
+    )
     if (!shadowChannel) return null
 
     // Create Shadow Thread
@@ -180,23 +196,26 @@ export class GlobalEventWatcher {
     // Post Status Message in Main Thread
     let statusMsg: Message | undefined
     if (postStatus) {
-        try {
-            const link = buildThreadLink(originThread.guildId, shadowThread.id)
-            statusMsg = await this.deps.sendThreadMessage(originThread, `🧠 [Thinking](${link})`)
-            this.statusMessages.set(messageId, statusMsg)
-        } catch (e) {
-            watcherLogger.error('Failed to post status message:', e)
-        }
+      try {
+        const link = buildThreadLink(originThread.guildId, shadowThread.id)
+        statusMsg = await this.deps.sendThreadMessage(
+          originThread,
+          `🧠 [Thinking](${link})`,
+        )
+        this.statusMessages.set(messageId, statusMsg)
+      } catch (e) {
+        watcherLogger.error('Failed to post status message:', e)
+      }
     }
 
     // Store as active interaction
     if (trackInteraction && statusMsg) {
-        this.activeInteractions.set(originThread.id, {
-            router,
-            statusMessage: statusMsg,
-            shadowThreadId: shadowThread.id,
-            messageIds: new Set([messageId])
-        })
+      this.activeInteractions.set(originThread.id, {
+        router,
+        statusMessage: statusMsg,
+        shadowThreadId: shadowThread.id,
+        messageIds: new Set([messageId]),
+      })
     }
 
     return router
@@ -230,32 +249,10 @@ export class GlobalEventWatcher {
     // Start SSE subscription loop immediately (don't wait for backfill)
     this.subscribeLoop()
 
-    // Run backfill in background
-    this.backfillMissedEvents().catch(e => {
+    // Run backfill in background (one-time startup backfill)
+    this.backfillMissedEvents().catch((e) => {
       watcherLogger.error('Backfill failed:', e)
     })
-
-    // Start periodic backfill for API-triggered messages (not emitted via SSE)
-    this.startPeriodicBackfill()
-  }
-
-  /**
-   * Start periodic backfill to catch API-triggered messages
-   */
-  private startPeriodicBackfill(): void {
-    if (this.backfillInterval) return
-    
-    this.backfillInterval = setInterval(async () => {
-      if (!this.isRunning || !this.client) return
-      
-      try {
-        await this.backfillMissedEvents()
-      } catch (e) {
-        watcherLogger.error('Periodic backfill failed:', e)
-      }
-    }, GlobalEventWatcher.BACKFILL_INTERVAL_MS)
-    
-    watcherLogger.log(`Started periodic backfill every ${GlobalEventWatcher.BACKFILL_INTERVAL_MS / 1000}s`)
   }
 
   /**
@@ -264,20 +261,15 @@ export class GlobalEventWatcher {
   stop(): void {
     watcherLogger.log('Stopping GlobalEventWatcher')
     this.isRunning = false
-    
+
     if (this.abortController) {
       this.abortController.abort()
       this.abortController = null
     }
-    
+
     if (this.reconnectTimeout) {
       clearTimeout(this.reconnectTimeout)
       this.reconnectTimeout = null
-    }
-
-    if (this.backfillInterval) {
-      clearInterval(this.backfillInterval)
-      this.backfillInterval = null
     }
 
     // Clear all typing indicators
@@ -294,7 +286,7 @@ export class GlobalEventWatcher {
     try {
       const response = await fetch(`http://localhost:${this.port}/provider`)
       if (!response.ok) return
-      const data = await response.json() as any
+      const data = (await response.json()) as any
       if (data.all && Array.isArray(data.all)) {
         for (const provider of data.all) {
           if (provider.models) {
@@ -304,7 +296,9 @@ export class GlobalEventWatcher {
             }
           }
         }
-        watcherLogger.log(`Loaded context limits for ${this.modelLimits.size} models`)
+        watcherLogger.log(
+          `Loaded context limits for ${this.modelLimits.size} models`,
+        )
       }
     } catch (e) {
       watcherLogger.error('Failed to fetch model limits:', e)
@@ -316,11 +310,15 @@ export class GlobalEventWatcher {
    */
   private getLinkedSessions(): ThreadSession[] {
     const db = this.deps.getDatabase()
-    const rows = db.prepare(`
+    const rows = db
+      .prepare(
+        `
       SELECT ts.thread_id, ts.session_id, td.directory
       FROM thread_sessions ts
       LEFT JOIN thread_directories td ON ts.thread_id = td.thread_id
-    `).all() as ThreadSession[]
+    `,
+      )
+      .all() as ThreadSession[]
     return rows
   }
 
@@ -331,9 +329,11 @@ export class GlobalEventWatcher {
     const db = this.deps.getDatabase()
     // If a session is linked to multiple threads (e.g. reused/resumed),
     // pick the most recently created thread.
-    const row = db.prepare(
-      'SELECT thread_id FROM thread_sessions WHERE session_id = ? ORDER BY created_at DESC'
-    ).get(sessionId) as { thread_id: string } | undefined
+    const row = db
+      .prepare(
+        'SELECT thread_id FROM thread_sessions WHERE session_id = ? ORDER BY created_at DESC',
+      )
+      .get(sessionId) as { thread_id: string } | undefined
     return row?.thread_id ?? null
   }
 
@@ -342,19 +342,23 @@ export class GlobalEventWatcher {
    */
   private isPartSent(partId: string): boolean {
     const db = this.deps.getDatabase()
-    const row = db.prepare(
-      'SELECT 1 FROM part_messages WHERE part_id = ?'
-    ).get(partId)
+    const row = db
+      .prepare('SELECT 1 FROM part_messages WHERE part_id = ?')
+      .get(partId)
     return !!row
   }
 
   /**
    * Record that a part was sent
    */
-  private recordPartSent(partId: string, messageId: string, threadId: string): void {
+  private recordPartSent(
+    partId: string,
+    messageId: string,
+    threadId: string,
+  ): void {
     const db = this.deps.getDatabase()
     db.prepare(
-      'INSERT OR REPLACE INTO part_messages (part_id, message_id, thread_id) VALUES (?, ?, ?)'
+      'INSERT OR REPLACE INTO part_messages (part_id, message_id, thread_id) VALUES (?, ?, ?)',
     ).run(partId, messageId, threadId)
   }
 
@@ -371,21 +375,27 @@ export class GlobalEventWatcher {
       try {
         await this.backfillSession(session.session_id, session.thread_id)
       } catch (e) {
-        watcherLogger.error(`Failed to backfill session ${session.session_id}:`, e)
+        watcherLogger.error(
+          `Failed to backfill session ${session.session_id}:`,
+          e,
+        )
       }
     }
-    
+
     watcherLogger.log(`Backfill completed for ${sessions.length} sessions`)
   }
 
-   /**
+  /**
    * Backfill a single session
-   * 
+   *
    * NOTE: Backfill routes assistant content to shadow threads only.
    * We also skip sessions that are actively streaming (have pending parts in sessionParts).
    */
 
-  private async backfillSession(sessionId: string, threadId: string): Promise<void> {
+  private async backfillSession(
+    sessionId: string,
+    threadId: string,
+  ): Promise<void> {
     // Skip sessions that are actively streaming - their parts may be incomplete
     if (this.sessionParts.has(sessionId)) {
       watcherLogger.log(`Skipping backfill for active session ${sessionId}`)
@@ -434,7 +444,10 @@ export class GlobalEventWatcher {
         } else if (part.type === 'tool' && part.state) {
           let toolContent = ''
           if (part.state.input) {
-            toolContent += formatPartForShadow('tool-input', { tool: part.tool, input: part.state.input })
+            toolContent += formatPartForShadow('tool-input', {
+              tool: part.tool,
+              input: part.state.input,
+            })
           }
           if (part.state.status === 'completed') {
             toolContent += formatPartForShadow('tool-output', {
@@ -442,7 +455,9 @@ export class GlobalEventWatcher {
               output: this.summarizeToolOutput(part.tool, part.state.output),
             })
           } else if (part.state.status === 'error') {
-            toolContent += formatPartForShadow('tool-error', { error: part.state.error })
+            toolContent += formatPartForShadow('tool-error', {
+              error: part.state.error,
+            })
           }
           formatted = toolContent
         } else if (part.type === 'patch') {
@@ -455,7 +470,10 @@ export class GlobalEventWatcher {
         if (!formatted.trim()) continue
 
         if (!backfillRouter) {
-          backfillRouter = await this.ensureShadowThread(messageId, thread, { postStatus: false, trackInteraction: false })
+          backfillRouter = await this.ensureShadowThread(messageId, thread, {
+            postStatus: false,
+            trackInteraction: false,
+          })
           if (!backfillRouter) break
           backfillShadowThreadId = this.shadowThreadIds.get(messageId) ?? null
         }
@@ -464,7 +482,8 @@ export class GlobalEventWatcher {
 
         // Track message IDs for cleanup
         this.shadowRouters.set(messageId, backfillRouter)
-        if (backfillShadowThreadId) this.shadowThreadIds.set(messageId, backfillShadowThreadId)
+        if (backfillShadowThreadId)
+          this.shadowThreadIds.set(messageId, backfillShadowThreadId)
         backfillMessageIds.add(messageId)
 
         await backfillRouter.sendComponent(formatted)
@@ -507,7 +526,9 @@ export class GlobalEventWatcher {
     }
 
     if (backfilledCount > 0) {
-      watcherLogger.log(`Backfilled ${backfilledCount} parts for session ${sessionId}`)
+      watcherLogger.log(
+        `Backfilled ${backfilledCount} parts for session ${sessionId}`,
+      )
     }
   }
 
@@ -521,7 +542,9 @@ export class GlobalEventWatcher {
     }
 
     try {
-      const channel = await this.deps.getDiscordClient().channels.fetch(threadId)
+      const channel = await this.deps
+        .getDiscordClient()
+        .channels.fetch(threadId)
       if (!channel || !(channel instanceof ThreadChannel)) {
         throw new Error('Not a thread')
       }
@@ -533,7 +556,10 @@ export class GlobalEventWatcher {
     }
   }
 
-  private async syncThreadTitleFromSession(sessionId: string, thread: ThreadChannel): Promise<void> {
+  private async syncThreadTitleFromSession(
+    sessionId: string,
+    thread: ThreadChannel,
+  ): Promise<void> {
     if (!this.client) return
 
     try {
@@ -558,7 +584,11 @@ export class GlobalEventWatcher {
     const directory = info?.directory
 
     if (!sessionId || !directory) return
-    if (this.autoResumeSince && info?.time?.created && info.time.created < this.autoResumeSince) {
+    if (
+      this.autoResumeSince &&
+      info?.time?.created &&
+      info.time.created < this.autoResumeSince
+    ) {
       return
     }
 
@@ -567,7 +597,10 @@ export class GlobalEventWatcher {
     const timeout = setTimeout(() => {
       this.autoResumeTimers.delete(sessionId)
       this.autoResumeSession(info).catch((error) => {
-        watcherLogger.error(`[SYNC] Auto-resume failed for ${sessionId}:`, error)
+        watcherLogger.error(
+          `[SYNC] Auto-resume failed for ${sessionId}:`,
+          error,
+        )
       })
     }, 2000)
 
@@ -590,18 +623,26 @@ export class GlobalEventWatcher {
     if (existing?.thread_id) return
 
     const channelRow = db
-      .prepare('SELECT channel_id FROM channel_directories WHERE directory = ? AND channel_type = ?')
+      .prepare(
+        'SELECT channel_id FROM channel_directories WHERE directory = ? AND channel_type = ?',
+      )
       .get(directory, 'text') as { channel_id: string } | undefined
 
     if (!channelRow?.channel_id) {
-      watcherLogger.log(`[SYNC] No channel found for directory ${directory}, skipping auto-resume`)
+      watcherLogger.log(
+        `[SYNC] No channel found for directory ${directory}, skipping auto-resume`,
+      )
       return
     }
 
-    const channel = await this.deps.getDiscordClient().channels.fetch(channelRow.channel_id)
+    const channel = await this.deps
+      .getDiscordClient()
+      .channels.fetch(channelRow.channel_id)
 
     if (!channel || !channel.isTextBased() || !('threads' in channel)) {
-      watcherLogger.log(`[SYNC] Channel ${channelRow.channel_id} not available for threads`)
+      watcherLogger.log(
+        `[SYNC] Channel ${channelRow.channel_id} not available for threads`,
+      )
       return
     }
 
@@ -621,19 +662,20 @@ export class GlobalEventWatcher {
       'INSERT OR REPLACE INTO thread_directories (thread_id, directory) VALUES (?, ?)',
     ).run(thread.id, directory)
 
-    await this.deps.sendThreadMessage(
-      thread,
-      `Session created: ${desiredName}`,
-    )
+    await this.deps.sendThreadMessage(thread, `Session created: ${desiredName}`)
 
-    watcherLogger.log(`[SYNC] Auto-resumed session ${sessionId} in thread ${thread.id}`)
+    watcherLogger.log(
+      `[SYNC] Auto-resumed session ${sessionId} in thread ${thread.id}`,
+    )
   }
 
   /**
    * Flush reasoning components for a message
    */
-  private async flushReasoningComponents(messageId: string, router: ShadowStreamRouter): Promise<void> {
-
+  private async flushReasoningComponents(
+    messageId: string,
+    router: ShadowStreamRouter,
+  ): Promise<void> {
     const parts = this.messageReasoningParts.get(messageId)
     if (!parts || parts.size === 0) return
 
@@ -663,7 +705,10 @@ export class GlobalEventWatcher {
     return preview
   }
 
-  private summarizeToolOutput(toolName: string, output: any): { summary: string; preview?: string } {
+  private summarizeToolOutput(
+    toolName: string,
+    output: any,
+  ): { summary: string; preview?: string } {
     const maxPreviewChars = 400
     const maxPreviewLines = 12
 
@@ -681,12 +726,22 @@ export class GlobalEventWatcher {
       if (output && typeof output === 'object') {
         const stdout = output.stdout || ''
         const stderr = output.stderr || ''
-        const code = output.code ?? output.exitCode ?? output.status ?? output.signal ?? 'unknown'
+        const code =
+          output.code ??
+          output.exitCode ??
+          output.status ??
+          output.signal ??
+          'unknown'
         const summary = `Exit ${code} • stdout ${String(stdout).length.toLocaleString()} chars • stderr ${String(stderr).length.toLocaleString()} chars`
         const previewSource = stderr || stdout
-        const preview = (previewSource && String(previewSource).length <= maxPreviewChars)
-          ? this.buildPreview(String(previewSource), maxPreviewLines, maxPreviewChars)
-          : undefined
+        const preview =
+          previewSource && String(previewSource).length <= maxPreviewChars
+            ? this.buildPreview(
+                String(previewSource),
+                maxPreviewLines,
+                maxPreviewChars,
+              )
+            : undefined
         return { summary, preview }
       }
     }
@@ -703,23 +758,33 @@ export class GlobalEventWatcher {
     }
 
     const summary = `Output ${text.length.toLocaleString()} chars`
-    const preview = text.length <= maxPreviewChars
-      ? this.buildPreview(text, maxPreviewLines, maxPreviewChars)
-      : undefined
+    const preview =
+      text.length <= maxPreviewChars
+        ? this.buildPreview(text, maxPreviewLines, maxPreviewChars)
+        : undefined
 
     return { summary, preview }
   }
 
-  private async flushToolComponent(partId: string, router: ShadowStreamRouter): Promise<void> {
+  private async flushToolComponent(
+    partId: string,
+    router: ShadowStreamRouter,
+  ): Promise<void> {
     const buffer = this.toolBuffers.get(partId)
     if (!buffer) return
 
     let content = ''
     if (buffer.input) {
-      content += formatPartForShadow('tool-input', { tool: buffer.tool, input: buffer.input })
+      content += formatPartForShadow('tool-input', {
+        tool: buffer.tool,
+        input: buffer.input,
+      })
     }
     if (buffer.output) {
-      content += formatPartForShadow('tool-output', { tool: buffer.tool, output: buffer.output })
+      content += formatPartForShadow('tool-output', {
+        tool: buffer.tool,
+        output: buffer.output,
+      })
     }
     if (buffer.error) {
       content += formatPartForShadow('tool-error', { error: buffer.error })
@@ -765,9 +830,13 @@ export class GlobalEventWatcher {
    * Main SSE subscription loop with reconnection
    */
   private async subscribeLoop(): Promise<void> {
+    let reconnectAttempt = 0
+    const MAX_RECONNECT_DELAY = 30000
+
     while (this.isRunning) {
       try {
         await this.subscribe()
+        reconnectAttempt = 0
       } catch (e) {
         if (!this.isRunning) break
         watcherLogger.error('SSE subscription error:', e)
@@ -775,11 +844,25 @@ export class GlobalEventWatcher {
 
       if (!this.isRunning) break
 
-      // Wait before reconnecting
-      watcherLogger.log('Reconnecting in 5 seconds...')
-      await new Promise(resolve => {
-        this.reconnectTimeout = setTimeout(resolve, 5000)
+      reconnectAttempt++
+      const baseDelay = Math.min(
+        1000 * 2 ** reconnectAttempt,
+        MAX_RECONNECT_DELAY,
+      )
+      const jitter = Math.floor(Math.random() * 1000)
+      const delay = baseDelay + jitter
+      watcherLogger.log(
+        `Reconnecting in ${delay}ms (attempt ${reconnectAttempt})...`,
+      )
+      await new Promise((resolve) => {
+        this.reconnectTimeout = setTimeout(resolve, delay)
       })
+
+      if (this.isRunning) {
+        this.backfillMissedEvents().catch((e) => {
+          watcherLogger.error('Post-reconnect backfill failed:', e)
+        })
+      }
     }
   }
 
@@ -809,10 +892,11 @@ export class GlobalEventWatcher {
    * Handle an SSE event
    */
   private async handleEvent(event: any): Promise<void> {
-    const sessionId = event.properties?.info?.sessionID 
-      || event.properties?.info?.id
-      || event.properties?.part?.sessionID
-      || event.properties?.sessionID
+    const sessionId =
+      event.properties?.info?.sessionID ||
+      event.properties?.info?.id ||
+      event.properties?.part?.sessionID ||
+      event.properties?.sessionID
 
     if (!sessionId) return
 
@@ -821,7 +905,12 @@ export class GlobalEventWatcher {
     // Check if this session is linked to a Discord thread
     const threadId = this.getThreadForSession(sessionId)
 
-    if (event.type === 'session.created' && this.autoResumeNewSessions && !threadId && info) {
+    if (
+      event.type === 'session.created' &&
+      this.autoResumeNewSessions &&
+      !threadId &&
+      info
+    ) {
       this.scheduleAutoResume(info)
     }
 
@@ -838,7 +927,9 @@ export class GlobalEventWatcher {
         try {
           markThreadRename(thread.id, desiredName)
           await thread.setName(desiredName)
-          watcherLogger.log(`Synced thread name to session title: "${desiredName}"`)
+          watcherLogger.log(
+            `Synced thread name to session title: "${desiredName}"`,
+          )
         } catch (e) {
           watcherLogger.error(`Failed to sync thread name for ${thread.id}:`, e)
         }
@@ -850,7 +941,7 @@ export class GlobalEventWatcher {
       const msg = event.properties.info
       if (msg && msg.id && msg.role) {
         this.messageRoles.set(msg.id, msg.role)
-        
+
         // Handle assistant message completion summary when message finishes with 'stop'
         if (msg.role === 'assistant' && msg.finish === 'stop') {
           const lastId = this.lastCompletedMessageIds.get(sessionId)
@@ -858,80 +949,86 @@ export class GlobalEventWatcher {
             this.lastCompletedMessageIds.set(sessionId, msg.id)
 
             this.stopTyping(threadId)
-            
+
             // 1. Send Final Text to MAIN thread (clean)
             const textParts = (msg.parts || [])
-                .filter((p: any) => p.type === 'text')
-                .map((p: any) => p.text)
-                .join('')
-            
+              .filter((p: any) => p.type === 'text')
+              .map((p: any) => p.text)
+              .join('')
+
             const bufferedText = this.messageTextBuffers.get(msg.id) || ''
             const finalText = textParts.trim() ? textParts : bufferedText
-            
+
             if (finalText.trim()) {
-                const chunks = splitDiscordMessage(finalText)
-                for (const chunk of chunks) {
-                    await this.deps.sendThreadMessage(thread, chunk)
-                }
+              const chunks = splitDiscordMessage(finalText)
+              for (const chunk of chunks) {
+                await this.deps.sendThreadMessage(thread, chunk)
+              }
             }
 
             // 2. Finalize Shadow Thread
             // Retrieve router via message ID (mapped during ensureShadowThread)
             const router = this.shadowRouters.get(msg.id)
-            
+
             // Get active interaction to cleanup ALL associated message IDs
             const activeInteraction = this.activeInteractions.get(thread.id)
-            
+
             if (router) {
-                await this.flushReasoningComponents(msg.id, router)
-                if (activeInteraction) {
-                    for (const mid of activeInteraction.messageIds) {
-                        if (mid !== msg.id) {
-                            await this.flushReasoningComponents(mid, router)
-                        }
-                    }
+              await this.flushReasoningComponents(msg.id, router)
+              if (activeInteraction) {
+                for (const mid of activeInteraction.messageIds) {
+                  if (mid !== msg.id) {
+                    await this.flushReasoningComponents(mid, router)
+                  }
                 }
+              }
 
-                if (finalText.trim()) {
-                    await router.sendComponent(finalText)
-                }
+              if (finalText.trim()) {
+                await router.sendComponent(finalText)
+              }
 
-                await router.end()
-                
-                // Cleanup all mappings for this interaction
-                if (activeInteraction) {
-                    for (const mid of activeInteraction.messageIds) {
-                        this.shadowRouters.delete(mid)
-                        this.shadowThreadIds.delete(mid)
-                        this.statusMessages.delete(mid)
-                    }
-                } else {
-                    // Fallback for single message (shouldn't happen with new logic)
-                    this.shadowRouters.delete(msg.id)
-                    this.shadowThreadIds.delete(msg.id)
-                    this.statusMessages.delete(msg.id)
+              await router.end()
+
+              // Cleanup all mappings for this interaction
+              if (activeInteraction) {
+                for (const mid of activeInteraction.messageIds) {
+                  this.shadowRouters.delete(mid)
+                  this.shadowThreadIds.delete(mid)
+                  this.statusMessages.delete(mid)
                 }
-                
-                // Clear active interaction for this thread
-                this.activeInteractions.delete(thread.id)
+              } else {
+                // Fallback for single message (shouldn't happen with new logic)
+                this.shadowRouters.delete(msg.id)
+                this.shadowThreadIds.delete(msg.id)
+                this.statusMessages.delete(msg.id)
+              }
+
+              // Clear active interaction for this thread
+              this.activeInteractions.delete(thread.id)
             }
 
             // 3. Update Status Message in MAIN thread
-            const statusMsg = activeInteraction?.statusMessage || this.statusMessages.get(msg.id)
+            const statusMsg =
+              activeInteraction?.statusMessage ||
+              this.statusMessages.get(msg.id)
 
             // Cleanup text buffers
             if (activeInteraction) {
-                for (const mid of activeInteraction.messageIds) {
-                    this.messageTextBuffers.delete(mid)
-                }
+              for (const mid of activeInteraction.messageIds) {
+                this.messageTextBuffers.delete(mid)
+              }
             } else {
-                this.messageTextBuffers.delete(msg.id)
+              this.messageTextBuffers.delete(msg.id)
             }
 
             try {
               const summary = this.buildCompletionSummary(msg)
-              const shadowThreadId = activeInteraction?.shadowThreadId || this.shadowThreadIds.get(msg.id)
-              const link = shadowThreadId ? buildThreadLink(thread.guildId, shadowThreadId) : ''
+              const shadowThreadId =
+                activeInteraction?.shadowThreadId ||
+                this.shadowThreadIds.get(msg.id)
+              const link = shadowThreadId
+                ? buildThreadLink(thread.guildId, shadowThreadId)
+                : ''
               const statusText = link
                 ? `✅ [Complete](${link})${summary ? ` • ${summary}` : ''}`
                 : `✅ Complete${summary ? ` • ${summary}` : ''}`
@@ -961,92 +1058,99 @@ export class GlobalEventWatcher {
 
       // Handle Assistant messages -> Route to Shadow
       if (role === 'assistant') {
-          // Initialize Shadow Thread if needed
-          const router = await this.ensureShadowThread(part.messageID, thread)
-          if (!router) return
+        // Initialize Shadow Thread if needed
+        const router = await this.ensureShadowThread(part.messageID, thread)
+        if (!router) return
 
-          // --- Reasoning ---
-          if (part.type === 'reasoning') {
-             const currentLen = part.text?.length || 0
-             const previousLen = this.partOffsets.get(part.id) || 0
-             const delta = part.text?.slice(previousLen) || ''
-             this.partOffsets.set(part.id, currentLen)
-             
-             if (delta) {
-                 const previousText = this.reasoningBuffers.get(part.id) || ''
-                 this.reasoningBuffers.set(part.id, previousText + delta)
+        // --- Reasoning ---
+        if (part.type === 'reasoning') {
+          const currentLen = part.text?.length || 0
+          const previousLen = this.partOffsets.get(part.id) || 0
+          const delta = part.text?.slice(previousLen) || ''
+          this.partOffsets.set(part.id, currentLen)
 
-                 const messageParts = this.messageReasoningParts.get(part.messageID) || new Set()
-                 messageParts.add(part.id)
-                 this.messageReasoningParts.set(part.messageID, messageParts)
-             }
+          if (delta) {
+            const previousText = this.reasoningBuffers.get(part.id) || ''
+            this.reasoningBuffers.set(part.id, previousText + delta)
+
+            const messageParts =
+              this.messageReasoningParts.get(part.messageID) || new Set()
+            messageParts.add(part.id)
+            this.messageReasoningParts.set(part.messageID, messageParts)
           }
-          
-          // --- Text (Streaming) ---
-          if (part.type === 'text') {
-             const currentLen = part.text?.length || 0
-             const previousLen = this.partOffsets.get(part.id) || 0
-             const delta = part.text?.slice(previousLen) || ''
-             this.partOffsets.set(part.id, currentLen)
-             
-             if (delta) {
-                 const previousText = this.messageTextBuffers.get(part.messageID) || ''
-                 this.messageTextBuffers.set(part.messageID, previousText + delta)
-             }
-          }
+        }
 
-          // --- Tool ---
-          if (part.type === 'tool') {
-             const statuses = this.partStatuses.get(part.id) || new Set()
-             
-             if (part.state.status === 'running' && part.state.input && !statuses.has('input')) {
-                 const buffer = this.toolBuffers.get(part.id) || { tool: part.tool }
-                 buffer.input = part.state.input
-                 this.toolBuffers.set(part.id, buffer)
-                 statuses.add('input')
-                 this.partStatuses.set(part.id, statuses)
-             }
-             
-             if (part.state.status === 'completed' && !statuses.has('output')) {
-                 const buffer = this.toolBuffers.get(part.id) || { tool: part.tool }
-                 buffer.output = this.summarizeToolOutput(part.tool, part.state.output)
-                 this.toolBuffers.set(part.id, buffer)
-                 statuses.add('output')
-                 this.partStatuses.set(part.id, statuses)
-                 await this.flushToolComponent(part.id, router)
-             }
-             
-             if (part.state.status === 'error' && !statuses.has('error')) {
-                 const buffer = this.toolBuffers.get(part.id) || { tool: part.tool }
-                 buffer.error = part.state.error
-                 this.toolBuffers.set(part.id, buffer)
-                 statuses.add('error')
-                 this.partStatuses.set(part.id, statuses)
-                 await this.flushToolComponent(part.id, router)
-             }
-          }
-          
-          // --- Diff/Patch ---
-          if (part.type === 'patch') {
-              const diffText = (part as any).diff || (part as any).text
-              const statuses = this.partStatuses.get(part.id) || new Set()
-              
-               if (diffText && !statuses.has('diff')) {
-                   await router.sendComponent(formatPartForShadow('diff', diffText))
-                   statuses.add('diff')
-                   this.partStatuses.set(part.id, statuses)
-               }
+        // --- Text (Streaming) ---
+        if (part.type === 'text') {
+          const currentLen = part.text?.length || 0
+          const previousLen = this.partOffsets.get(part.id) || 0
+          const delta = part.text?.slice(previousLen) || ''
+          this.partOffsets.set(part.id, currentLen)
 
+          if (delta) {
+            const previousText =
+              this.messageTextBuffers.get(part.messageID) || ''
+            this.messageTextBuffers.set(part.messageID, previousText + delta)
+          }
+        }
+
+        // --- Tool ---
+        if (part.type === 'tool') {
+          const statuses = this.partStatuses.get(part.id) || new Set()
+
+          if (
+            part.state.status === 'running' &&
+            part.state.input &&
+            !statuses.has('input')
+          ) {
+            const buffer = this.toolBuffers.get(part.id) || { tool: part.tool }
+            buffer.input = part.state.input
+            this.toolBuffers.set(part.id, buffer)
+            statuses.add('input')
+            this.partStatuses.set(part.id, statuses)
           }
 
-          // Typing indicator logic
-          if (part.type === 'step-start') {
-            this.startTyping(threadId, thread)
-          } else if (part.type === 'step-finish') {
-            await this.flushReasoningComponents(part.messageID, router)
+          if (part.state.status === 'completed' && !statuses.has('output')) {
+            const buffer = this.toolBuffers.get(part.id) || { tool: part.tool }
+            buffer.output = this.summarizeToolOutput(
+              part.tool,
+              part.state.output,
+            )
+            this.toolBuffers.set(part.id, buffer)
+            statuses.add('output')
+            this.partStatuses.set(part.id, statuses)
+            await this.flushToolComponent(part.id, router)
           }
+
+          if (part.state.status === 'error' && !statuses.has('error')) {
+            const buffer = this.toolBuffers.get(part.id) || { tool: part.tool }
+            buffer.error = part.state.error
+            this.toolBuffers.set(part.id, buffer)
+            statuses.add('error')
+            this.partStatuses.set(part.id, statuses)
+            await this.flushToolComponent(part.id, router)
+          }
+        }
+
+        // --- Diff/Patch ---
+        if (part.type === 'patch') {
+          const diffText = (part as any).diff || (part as any).text
+          const statuses = this.partStatuses.get(part.id) || new Set()
+
+          if (diffText && !statuses.has('diff')) {
+            await router.sendComponent(formatPartForShadow('diff', diffText))
+            statuses.add('diff')
+            this.partStatuses.set(part.id, statuses)
+          }
+        }
+
+        // Typing indicator logic
+        if (part.type === 'step-start') {
+          this.startTyping(threadId, thread)
+        } else if (part.type === 'step-finish') {
+          await this.flushReasoningComponents(part.messageID, router)
+        }
       }
-
     } else if (event.type === 'session.completed') {
       this.stopTyping(threadId)
       this.sessionParts.delete(sessionId)
@@ -1080,7 +1184,8 @@ export class GlobalEventWatcher {
         }
       }
       this.activeInteractions.delete(threadId)
-      const errorMessage = event.properties?.error?.data?.message || 'Unknown error'
+      const errorMessage =
+        event.properties?.error?.data?.message || 'Unknown error'
       try {
         await this.deps.sendThreadMessage(thread, `**Error:** ${errorMessage}`)
       } catch (e) {
@@ -1095,19 +1200,19 @@ export class GlobalEventWatcher {
   private buildCompletionSummary(msg: any): string {
     const tokens = msg.tokens || {}
     const info = msg
-    
+
     let summaryParts: string[] = []
 
     if (tokens) {
-      const input = (tokens.input || 0)
-      const output = (tokens.output || 0)
-      const reasoning = (tokens.reasoning || 0)
-      const cacheRead = (tokens.cache?.read || 0)
+      const input = tokens.input || 0
+      const output = tokens.output || 0
+      const reasoning = tokens.reasoning || 0
+      const cacheRead = tokens.cache?.read || 0
       const total = input + output + reasoning
-      
+
       if (total > 0) {
         let tokensStr = `Tokens: ${total.toLocaleString()}`
-        
+
         // Calculate percentage
         const limit = this.modelLimits.get(info.modelID)
         if (limit) {
@@ -1115,7 +1220,7 @@ export class GlobalEventWatcher {
           const percent = ((usage / limit) * 100).toFixed(1)
           tokensStr += ` (${percent}%)`
         }
-        
+
         summaryParts.push(tokensStr)
       }
     }
@@ -1124,7 +1229,7 @@ export class GlobalEventWatcher {
     if (info.time?.created && info.time?.completed) {
       const duration = info.time.completed - info.time.created
       if (duration > 0) {
-         summaryParts.push(`Time: ${prettyMilliseconds(duration)}`)
+        summaryParts.push(`Time: ${prettyMilliseconds(duration)}`)
       }
     }
 
@@ -1138,24 +1243,33 @@ export class GlobalEventWatcher {
   /**
    * Send a part to Discord (with deduplication)
    */
-  private async sendPart(part: Part, thread: ThreadChannel, threadId: string, role: string = 'assistant'): Promise<void> {
+  private async sendPart(
+    part: Part,
+    thread: ThreadChannel,
+    threadId: string,
+    role: string = 'assistant',
+  ): Promise<void> {
     if (this.isPartSent(part.id)) return
 
     let content = this.deps.formatPart(part)
-    
+
     // User message echo prevention and formatting
     if (role === 'user' && part.type === 'text') {
       // Fetch recent messages to check for echo
-      const lastMessages = await thread.messages.fetch({ limit: 10 }).catch(() => null)
-      
+      const lastMessages = await thread.messages
+        .fetch({ limit: 10 })
+        .catch(() => null)
+
       // Find a recent message from a non-bot user that matches the content
       // This handles cases where attachments are appended to the prompt
       const partText = (part.text || '').trim()
-      
+
       // Also check the thread starter message (it may have different format)
-      const starterMessage = thread.id ? await thread.fetchStarterMessage().catch(() => null) : null
-      
-      const recentUserMessage = lastMessages?.find(msg => {
+      const starterMessage = thread.id
+        ? await thread.fetchStarterMessage().catch(() => null)
+        : null
+
+      const recentUserMessage = lastMessages?.find((msg) => {
         // Must be from a non-bot user
         if (msg.author.bot) return false
         // Must be recent (within last 2 minutes)
@@ -1164,16 +1278,21 @@ export class GlobalEventWatcher {
         // Content should match or be a prefix of the part text (attachments get appended)
         const msgContent = msg.content.trim()
         // Check both directions: Discord content is prefix of part, or exact match
-        return partText === msgContent || partText.startsWith(msgContent) || msgContent.startsWith(partText)
+        return (
+          partText === msgContent ||
+          partText.startsWith(msgContent) ||
+          msgContent.startsWith(partText)
+        )
       })
-      
+
       // Also check starter message
-      const starterMatch = starterMessage && !starterMessage.author.bot && (
-        partText === starterMessage.content.trim() ||
-        partText.startsWith(starterMessage.content.trim()) ||
-        starterMessage.content.trim().startsWith(partText)
-      )
-      
+      const starterMatch =
+        starterMessage &&
+        !starterMessage.author.bot &&
+        (partText === starterMessage.content.trim() ||
+          partText.startsWith(starterMessage.content.trim()) ||
+          starterMessage.content.trim().startsWith(partText))
+
       if (recentUserMessage || starterMatch) {
         // Echo detected - message originated from Discord, not TUI
         const matchedMsg = recentUserMessage || starterMessage!
@@ -1189,7 +1308,10 @@ export class GlobalEventWatcher {
     if (typeof content !== 'string' || !content.trim()) return
 
     try {
-      const message = await this.deps.sendThreadMessage(thread, content + '\n\n')
+      const message = await this.deps.sendThreadMessage(
+        thread,
+        content + '\n\n',
+      )
       this.recordPartSent(part.id, message.id, threadId)
     } catch (e) {
       watcherLogger.error(`Failed to send part ${part.id}:`, e)

@@ -47,11 +47,15 @@ import * as prism from 'prism-media'
 import dedent from 'string-dedent'
 import { transcribeAudio } from './voice.js'
 import { extractTagsArrays, extractNonXmlContent } from './xml.js'
+import { safeSendDiscordText } from './discord-send.js'
 import prettyMilliseconds from 'pretty-ms'
 import type { Session } from '@google/genai'
 import { createLogger } from './logger.js'
 import { isAbortError } from './utils.js'
-import { GlobalEventWatcher, type WatcherDependencies } from './global-event-watcher.js'
+import {
+  GlobalEventWatcher,
+  type WatcherDependencies,
+} from './global-event-watcher.js'
 import {
   buildThreadTitle,
   consumePendingThreadRename,
@@ -62,13 +66,15 @@ import { setGlobalDispatcher, Agent } from 'undici'
 // disables the automatic 5 minutes abort after no body
 setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0 }))
 
-type ParsedCommand = {
-  isCommand: true
-  command: string
-  arguments: string
-} | {
-  isCommand: false
-}
+type ParsedCommand =
+  | {
+      isCommand: true
+      command: string
+      arguments: string
+    }
+  | {
+      isCommand: false
+    }
 function parseSlashCommand(text: string): ParsedCommand {
   const trimmed = text.trim()
   if (!trimmed.startsWith('/')) {
@@ -643,7 +649,6 @@ export function getDatabase(): Database.Database {
       )
     `)
 
-
     db.exec(`
       CREATE TABLE IF NOT EXISTS part_messages (
         part_id TEXT PRIMARY KEY,
@@ -695,12 +700,22 @@ export function getDatabase(): Database.Database {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `)
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS thread_sessions (
+        thread_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `)
   }
 
   return db
 }
 
-export async function ensureKimakiCategory(guild: Guild): Promise<CategoryChannel> {
+export async function ensureKimakiCategory(
+  guild: Guild,
+): Promise<CategoryChannel> {
   const existingCategory = guild.channels.cache.find(
     (channel): channel is CategoryChannel => {
       if (channel.type !== ChannelType.GuildCategory) {
@@ -729,7 +744,11 @@ export async function createProjectChannels({
   guild: Guild
   projectDirectory: string
   appId: string
-}): Promise<{ textChannelId: string; voiceChannelId: string; channelName: string }> {
+}): Promise<{
+  textChannelId: string
+  voiceChannelId: string
+  channelName: string
+}> {
   const baseName = path.basename(projectDirectory)
   const channelName = `${baseName}`
     .toLowerCase()
@@ -798,31 +817,27 @@ async function sendThreadMessage(
   thread: ThreadChannel,
   content: string,
 ): Promise<Message> {
-  const MAX_LENGTH = 2000
-
   content = escapeBackticksInCodeBlocks(content)
 
-  const chunks = splitMarkdownForDiscord({ content, maxLength: MAX_LENGTH })
+  const result = await safeSendDiscordText({
+    channelId: thread.id,
+    content,
+    send: async (chunk) => {
+      return thread.send(chunk)
+    },
+    split: (text) => {
+      return splitMarkdownForDiscord({ content: text, maxLength: 2000 })
+    },
+    logger: discordLogger,
+    context: `sendThreadMessage thread=${thread.id}`,
+    maxAttempts: 3,
+  })
 
-  if (chunks.length > 1) {
-    discordLogger.log(
-      `MESSAGE: Splitting ${content.length} chars into ${chunks.length} messages`,
-    )
+  if (!result.firstMessage) {
+    throw new Error('Failed to send message to thread')
   }
 
-  let firstMessage: Message | undefined
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i]
-    if (!chunk) {
-      continue
-    }
-    const message = await thread.send(chunk)
-    if (i === 0) {
-      firstMessage = message
-    }
-  }
-
-  return firstMessage!
+  return result.firstMessage
 }
 
 async function waitForServer(port: number, maxAttempts = 30): Promise<boolean> {
@@ -1055,19 +1070,43 @@ export function splitMarkdownForDiscord({
   for (const token of tokens) {
     if (token.type === 'code') {
       const lang = token.lang || ''
-      lines.push({ text: '```' + lang + '\n', inCodeBlock: false, lang, isOpeningFence: true, isClosingFence: false })
+      lines.push({
+        text: '```' + lang + '\n',
+        inCodeBlock: false,
+        lang,
+        isOpeningFence: true,
+        isClosingFence: false,
+      })
       const codeLines = token.text.split('\n')
       for (const codeLine of codeLines) {
-        lines.push({ text: codeLine + '\n', inCodeBlock: true, lang, isOpeningFence: false, isClosingFence: false })
+        lines.push({
+          text: codeLine + '\n',
+          inCodeBlock: true,
+          lang,
+          isOpeningFence: false,
+          isClosingFence: false,
+        })
       }
-      lines.push({ text: '```\n', inCodeBlock: false, lang: '', isOpeningFence: false, isClosingFence: true })
+      lines.push({
+        text: '```\n',
+        inCodeBlock: false,
+        lang: '',
+        isOpeningFence: false,
+        isClosingFence: true,
+      })
     } else {
       const rawLines = token.raw.split('\n')
       for (let i = 0; i < rawLines.length; i++) {
         const isLast = i === rawLines.length - 1
         const text = isLast ? rawLines[i]! : rawLines[i]! + '\n'
         if (text) {
-          lines.push({ text, inCodeBlock: false, lang: '', isOpeningFence: false, isClosingFence: false })
+          lines.push({
+            text,
+            inCodeBlock: false,
+            lang: '',
+            isOpeningFence: false,
+            isClosingFence: false,
+          })
         }
       }
     }
@@ -1086,16 +1125,16 @@ export function splitMarkdownForDiscord({
 
     while (textRemaining.length > 0) {
       // Calculate available space, reserving room for a closing fence if needed
-      const closingOverhead = (currentLang !== null) ? 4 : 0 // \n```
+      const closingOverhead = currentLang !== null ? 4 : 0 // \n```
       const space = maxLength - currentChunk.length - closingOverhead
 
       // If no space left (and not just an opening fence), flush
       if (space <= 0) {
-         if (currentLang !== null) currentChunk += '\n```'
-         chunks.push(currentChunk)
-         currentChunk = ''
-         if (currentLang !== null) currentChunk += '```' + currentLang + '\n'
-         continue 
+        if (currentLang !== null) currentChunk += '\n```'
+        chunks.push(currentChunk)
+        currentChunk = ''
+        if (currentLang !== null) currentChunk += '```' + currentLang + '\n'
+        continue
       }
 
       if (textRemaining.length <= space) {
@@ -1104,14 +1143,16 @@ export function splitMarkdownForDiscord({
       } else {
         // Text is too long for current chunk.
         // If current chunk is not "fresh" (has content beyond opening fence), flush it first.
-        const isFresh = currentChunk.length === 0 || (currentLang !== null && currentChunk === '```' + currentLang + '\n')
-        
+        const isFresh =
+          currentChunk.length === 0 ||
+          (currentLang !== null && currentChunk === '```' + currentLang + '\n')
+
         if (!isFresh) {
-            if (currentLang !== null) currentChunk += '\n```'
-            chunks.push(currentChunk)
-            currentChunk = ''
-            if (currentLang !== null) currentChunk += '```' + currentLang + '\n'
-            continue
+          if (currentLang !== null) currentChunk += '\n```'
+          chunks.push(currentChunk)
+          currentChunk = ''
+          if (currentLang !== null) currentChunk += '```' + currentLang + '\n'
+          continue
         }
 
         // Chunk is fresh but text is still too long -> Split the text
@@ -1202,7 +1243,10 @@ function getKimakiMetadata(textChannel: TextChannel | null): {
 }
 
 // Map of directory to external server client (no spawned process)
-const externalServerClients = new Map<string, { client: OpencodeClient; port: number }>()
+const externalServerClients = new Map<
+  string,
+  { client: OpencodeClient; port: number }
+>()
 
 // Default port for external opencode-server (Supervisor-managed)
 const DEFAULT_EXTERNAL_PORT = 39293
@@ -1427,7 +1471,9 @@ function getToolSummaryText(part: Part): string {
     const added = newString.split('\n').length
     const removed = oldString.split('\n').length
     const fileName = filePath.split('/').pop() || ''
-    return fileName ? `*${fileName}* (+${added}-${removed})` : `(+${added}-${removed})`
+    return fileName
+      ? `*${fileName}* (+${added}-${removed})`
+      : `(+${added}-${removed})`
   }
 
   if (part.tool === 'write') {
@@ -1435,7 +1481,9 @@ function getToolSummaryText(part: Part): string {
     const content = String(part.state.input?.content || '')
     const lines = content.split('\n').length
     const fileName = filePath.split('/').pop() || ''
-    return fileName ? `*${fileName}* (${lines} line${lines === 1 ? '' : 's'})` : `(${lines} line${lines === 1 ? '' : 's'})`
+    return fileName
+      ? `*${fileName}* (${lines} line${lines === 1 ? '' : 's'})`
+      : `(${lines} line${lines === 1 ? '' : 's'})`
   }
 
   if (part.tool === 'webfetch') {
@@ -1466,7 +1514,12 @@ function getToolSummaryText(part: Part): string {
     return pattern ? `*${pattern}*` : ''
   }
 
-  if (part.tool === 'bash' || part.tool === 'task' || part.tool === 'todoread' || part.tool === 'todowrite') {
+  if (
+    part.tool === 'bash' ||
+    part.tool === 'task' ||
+    part.tool === 'todoread' ||
+    part.tool === 'todowrite'
+  ) {
     return ''
   }
 
@@ -1475,8 +1528,10 @@ function getToolSummaryText(part: Part): string {
   const inputFields = Object.entries(part.state.input)
     .map(([key, value]) => {
       if (value === null || value === undefined) return null
-      const stringValue = typeof value === 'string' ? value : JSON.stringify(value)
-      const truncatedValue = stringValue.length > 300 ? stringValue.slice(0, 300) + '…' : stringValue
+      const stringValue =
+        typeof value === 'string' ? value : JSON.stringify(value)
+      const truncatedValue =
+        stringValue.length > 300 ? stringValue.slice(0, 300) + '…' : stringValue
       return `${key}: ${truncatedValue}`
     })
     .filter(Boolean)
@@ -1522,7 +1577,11 @@ function formatPart(part: Part): string {
     return `📄 ${part.filename || 'File'}`
   }
 
-  if (part.type === 'step-start' || part.type === 'step-finish' || part.type === 'patch') {
+  if (
+    part.type === 'step-start' ||
+    part.type === 'step-finish' ||
+    part.type === 'patch'
+  ) {
     return ''
   }
 
@@ -1592,7 +1651,7 @@ export async function createDiscordClient() {
 
 /**
  * handleOpencodeSession - Sync-integrated Version
- * 
+ *
  * The GlobalEventWatcher handles all event streaming and Discord message sending.
  * This function now only:
  * 1. Gets/creates a session
@@ -1635,14 +1694,21 @@ async function handleOpencodeSession({
 
   // Get thread model preference from database
   const threadModelRow = getDatabase()
-    .prepare('SELECT provider_id, model_id FROM thread_models WHERE thread_id = ?')
+    .prepare(
+      'SELECT provider_id, model_id FROM thread_models WHERE thread_id = ?',
+    )
     .get(thread.id) as { provider_id: string; model_id: string } | undefined
   const threadModel = threadModelRow
-    ? { providerID: threadModelRow.provider_id, modelID: threadModelRow.model_id }
+    ? {
+        providerID: threadModelRow.provider_id,
+        modelID: threadModelRow.model_id,
+      }
     : undefined
 
   if (threadModel) {
-    sessionLogger.log(`Using thread model: ${threadModel.providerID}/${threadModel.modelID}`)
+    sessionLogger.log(
+      `Using thread model: ${threadModel.providerID}/${threadModel.modelID}`,
+    )
   }
 
   // Get session ID from database
@@ -1668,7 +1734,8 @@ async function handleOpencodeSession({
   }
 
   if (!session) {
-    const sessionTitle = prompt.length > 80 ? prompt.slice(0, 77) + '...' : prompt.slice(0, 80)
+    const sessionTitle =
+      prompt.length > 80 ? prompt.slice(0, 77) + '...' : prompt.slice(0, 80)
     voiceLogger.log(
       `[SESSION] Creating new session with title: "${sessionTitle}"`,
     )
@@ -1700,7 +1767,7 @@ async function handleOpencodeSession({
 
   try {
     let response: { data?: unknown; error?: unknown; response: Response }
-    
+
     if (parsedCommand?.isCommand) {
       sessionLogger.log(
         `[COMMAND] Sending command /${parsedCommand.command} to session ${session.id} with args: "${parsedCommand.arguments.slice(0, 100)}${parsedCommand.arguments.length > 100 ? '...' : ''}"`,
@@ -1719,7 +1786,14 @@ async function handleOpencodeSession({
         `[PROMPT] Sending prompt to session ${session.id}: "${prompt.slice(0, 100)}${prompt.length > 100 ? '...' : ''}"`,
       )
       if (images.length > 0) {
-        sessionLogger.log(`[PROMPT] Sending ${images.length} image(s):`, images.map((img) => ({ mime: img.mime, filename: img.filename, url: img.url.slice(0, 100) })))
+        sessionLogger.log(
+          `[PROMPT] Sending ${images.length} image(s):`,
+          images.map((img) => ({
+            mime: img.mime,
+            filename: img.filename,
+            url: img.url.slice(0, 100),
+          })),
+        )
       }
 
       const parts = [{ type: 'text' as const, text: prompt }, ...images]
@@ -1741,16 +1815,27 @@ async function handleOpencodeSession({
       const errorMessage = (() => {
         const err = response.error
         if (err && typeof err === 'object') {
-          if ('data' in err && err.data && typeof err.data === 'object' && 'message' in err.data) {
+          if (
+            'data' in err &&
+            err.data &&
+            typeof err.data === 'object' &&
+            'message' in err.data
+          ) {
             return String(err.data.message)
           }
-          if ('errors' in err && Array.isArray(err.errors) && err.errors.length > 0) {
+          if (
+            'errors' in err &&
+            Array.isArray(err.errors) &&
+            err.errors.length > 0
+          ) {
             return JSON.stringify(err.errors)
           }
         }
         return JSON.stringify(err)
       })()
-      throw new Error(`OpenCode API error (${response.response.status}): ${errorMessage}`)
+      throw new Error(
+        `OpenCode API error (${response.response.status}): ${errorMessage}`,
+      )
     }
 
     sessionLogger.log(`Successfully sent prompt, got response`)
@@ -1873,8 +1958,10 @@ export async function startDiscordBot({
     // Check if external server is available
     const externalAvailable = await checkExternalServer(externalPort)
     if (externalAvailable) {
-      discordLogger.log(`[SYNC] Starting GlobalEventWatcher on port ${externalPort}`)
-      
+      discordLogger.log(
+        `[SYNC] Starting GlobalEventWatcher on port ${externalPort}`,
+      )
+
       const watcherDeps: WatcherDependencies = {
         getDatabase,
         getDiscordClient: () => c,
@@ -1896,14 +1983,18 @@ export async function startDiscordBot({
       await globalEventWatcher.start()
       discordLogger.log(`[SYNC] GlobalEventWatcher started successfully`)
     } else {
-      discordLogger.log(`[SYNC] No external server on port ${externalPort}, watcher not started (fallback mode)`)
+      discordLogger.log(
+        `[SYNC] No external server on port ${externalPort}, watcher not started (fallback mode)`,
+      )
     }
   }
 
   // Check if client is already ready (happens when passed from cli.ts)
   if (discordClient.isReady()) {
-    discordLogger.log(`Discord client already ready, initializing sync watcher immediately`)
-    initializeSyncWatcher(discordClient).catch(e => {
+    discordLogger.log(
+      `Discord client already ready, initializing sync watcher immediately`,
+    )
+    initializeSyncWatcher(discordClient).catch((e) => {
       discordLogger.error(`[SYNC] Failed to initialize watcher:`, e)
     })
   }
@@ -2345,7 +2436,8 @@ export async function startDiscordBot({
 
                   let title = session.title
                   if (title.length > maxTitleLength) {
-                    title = title.slice(0, Math.max(0, maxTitleLength - 1)) + '…'
+                    title =
+                      title.slice(0, Math.max(0, maxTitleLength - 1)) + '…'
                   }
 
                   return {
@@ -2445,7 +2537,6 @@ export async function startDiscordBot({
                   .filter((choice) => choice.value.length <= 100)
                   .slice(0, 25) // Discord limit
 
-
                 await interaction.respond(choices)
               } catch (error) {
                 voiceLogger.error('[AUTOCOMPLETE] Error fetching files:', error)
@@ -2482,7 +2573,8 @@ export async function startDiscordBot({
               const projects = availableProjects
                 .filter((project) => {
                   const baseName = path.basename(project.worktree)
-                  const searchText = `${baseName} ${project.worktree}`.toLowerCase()
+                  const searchText =
+                    `${baseName} ${project.worktree}`.toLowerCase()
                   return searchText.includes(focusedValue.toLowerCase())
                 })
                 .sort((a, b) => {
@@ -2533,13 +2625,17 @@ export async function startDiscordBot({
                 channel.type === ChannelType.AnnouncementThread
               ) {
                 const threadRow = getDatabase()
-                  .prepare('SELECT directory FROM thread_directories WHERE thread_id = ?')
+                  .prepare(
+                    'SELECT directory FROM thread_directories WHERE thread_id = ?',
+                  )
                   .get(channel.id) as { directory: string } | undefined
 
                 if (threadRow?.directory) {
                   projectDirectory = threadRow.directory
                 } else {
-                  const textChannel = resolveTextChannel(channel as ThreadChannel)
+                  const textChannel = resolveTextChannel(
+                    channel as ThreadChannel,
+                  )
                   if (textChannel) {
                     const { projectDirectory: directory, channelAppId } =
                       getKimakiMetadata(textChannel)
@@ -2578,15 +2674,21 @@ export async function startDiscordBot({
               for (const provider of providersResponse.data.all) {
                 if (!provider.models) continue
 
-                for (const [modelId, modelInfo] of Object.entries(provider.models)) {
+                for (const [modelId, modelInfo] of Object.entries(
+                  provider.models,
+                )) {
                   const fullModelId = `${provider.id}/${modelId}`
                   const displayName = modelInfo.name || modelId
 
                   // Filter by search query
                   if (
                     focusedValue &&
-                    !fullModelId.toLowerCase().includes(focusedValue.toLowerCase()) &&
-                    !displayName.toLowerCase().includes(focusedValue.toLowerCase())
+                    !fullModelId
+                      .toLowerCase()
+                      .includes(focusedValue.toLowerCase()) &&
+                    !displayName
+                      .toLowerCase()
+                      .includes(focusedValue.toLowerCase())
                   ) {
                     continue
                   }
@@ -2838,7 +2940,8 @@ export async function startDiscordBot({
               }
 
               const partsToRender = allAssistantParts.slice(-30)
-              const skippedCount = allAssistantParts.length - partsToRender.length
+              const skippedCount =
+                allAssistantParts.length - partsToRender.length
 
               if (skippedCount > 0) {
                 await sendThreadMessage(
@@ -2891,7 +2994,9 @@ export async function startDiscordBot({
             const guild = command.guild
 
             if (!guild) {
-              await command.editReply('This command can only be used in a guild')
+              await command.editReply(
+                'This command can only be used in a guild',
+              )
               return
             }
 
@@ -2917,7 +3022,9 @@ export async function startDiscordBot({
               const directory = project.worktree
 
               if (!fs.existsSync(directory)) {
-                await command.editReply(`Directory does not exist: ${directory}`)
+                await command.editReply(
+                  `Directory does not exist: ${directory}`,
+                )
                 return
               }
 
@@ -2963,12 +3070,16 @@ export async function startDiscordBot({
             const channel = command.channel
 
             if (!guild) {
-              await command.editReply('This command can only be used in a guild')
+              await command.editReply(
+                'This command can only be used in a guild',
+              )
               return
             }
 
             if (!channel || channel.type !== ChannelType.GuildText) {
-              await command.editReply('This command can only be used in a text channel')
+              await command.editReply(
+                'This command can only be used in a text channel',
+              )
               return
             }
 
@@ -2994,12 +3105,16 @@ export async function startDiscordBot({
               }
 
               if (fs.existsSync(projectDirectory)) {
-                await command.editReply(`Project directory already exists: ${projectDirectory}`)
+                await command.editReply(
+                  `Project directory already exists: ${projectDirectory}`,
+                )
                 return
               }
 
               fs.mkdirSync(projectDirectory, { recursive: true })
-              discordLogger.log(`Created project directory: ${projectDirectory}`)
+              discordLogger.log(
+                `Created project directory: ${projectDirectory}`,
+              )
 
               const { execSync } = await import('node:child_process')
               execSync('git init', { cwd: projectDirectory, stdio: 'pipe' })
@@ -3012,7 +3127,9 @@ export async function startDiscordBot({
                   appId: currentAppId!,
                 })
 
-              const textChannel = await guild.channels.fetch(textChannelId) as TextChannel
+              const textChannel = (await guild.channels.fetch(
+                textChannelId,
+              )) as TextChannel
 
               await command.editReply(
                 `✅ Created new project **${sanitizedName}**\n📁 Directory: \`${projectDirectory}\`\n📝 Text: <#${textChannelId}>\n🔊 Voice: <#${voiceChannelId}>\n\n_Starting session..._`,
@@ -3029,7 +3146,8 @@ export async function startDiscordBot({
               })
 
               await handleOpencodeSession({
-                prompt: 'The project was just initialized. Say hi and ask what the user wants to build.',
+                prompt:
+                  'The project was just initialized. Say hi and ask what the user wants to build.',
                 thread,
                 projectDirectory,
               })
@@ -3047,7 +3165,8 @@ export async function startDiscordBot({
             command.commandName === 'accept' ||
             command.commandName === 'accept-always'
           ) {
-            const scope = command.commandName === 'accept-always' ? 'always' : 'once'
+            const scope =
+              command.commandName === 'accept-always' ? 'always' : 'once'
             const channel = command.channel
 
             if (!channel) {
@@ -3066,7 +3185,8 @@ export async function startDiscordBot({
 
             if (!isThread) {
               await command.reply({
-                content: 'This command can only be used in a thread with an active session',
+                content:
+                  'This command can only be used in a thread with an active session',
                 ephemeral: true,
               })
               return
@@ -3082,7 +3202,9 @@ export async function startDiscordBot({
             }
 
             try {
-              const getClient = await initializeOpencodeForDirectory(pending.directory)
+              const getClient = await initializeOpencodeForDirectory(
+                pending.directory,
+              )
               await getClient().postSessionIdPermissionsPermissionId({
                 path: {
                   id: pending.permission.sessionID,
@@ -3128,7 +3250,8 @@ export async function startDiscordBot({
 
             if (!isThread) {
               await command.reply({
-                content: 'This command can only be used in a thread with an active session',
+                content:
+                  'This command can only be used in a thread with an active session',
                 ephemeral: true,
               })
               return
@@ -3144,7 +3267,9 @@ export async function startDiscordBot({
             }
 
             try {
-              const getClient = await initializeOpencodeForDirectory(pending.directory)
+              const getClient = await initializeOpencodeForDirectory(
+                pending.directory,
+              )
               await getClient().postSessionIdPermissionsPermissionId({
                 path: {
                   id: pending.permission.sessionID,
@@ -3184,25 +3309,30 @@ export async function startDiscordBot({
 
             if (!isThread) {
               await command.reply({
-                content: 'This command can only be used in a thread with an active session',
+                content:
+                  'This command can only be used in a thread with an active session',
                 ephemeral: true,
               })
               return
             }
 
             const textChannel = resolveTextChannel(channel as ThreadChannel)
-            const { projectDirectory: directory } = getKimakiMetadata(textChannel)
+            const { projectDirectory: directory } =
+              getKimakiMetadata(textChannel)
 
             if (!directory) {
               await command.reply({
-                content: 'Could not determine project directory for this channel',
+                content:
+                  'Could not determine project directory for this channel',
                 ephemeral: true,
               })
               return
             }
 
             const row = getDatabase()
-              .prepare('SELECT session_id FROM thread_sessions WHERE thread_id = ?')
+              .prepare(
+                'SELECT session_id FROM thread_sessions WHERE thread_id = ?',
+              )
               .get(channel.id) as { session_id: string } | undefined
 
             if (!row?.session_id) {
@@ -3255,25 +3385,30 @@ export async function startDiscordBot({
 
             if (!isThread) {
               await command.reply({
-                content: 'This command can only be used in a thread with an active session',
+                content:
+                  'This command can only be used in a thread with an active session',
                 ephemeral: true,
               })
               return
             }
 
             const textChannel = resolveTextChannel(channel as ThreadChannel)
-            const { projectDirectory: directory } = getKimakiMetadata(textChannel)
+            const { projectDirectory: directory } =
+              getKimakiMetadata(textChannel)
 
             if (!directory) {
               await command.reply({
-                content: 'Could not determine project directory for this channel',
+                content:
+                  'Could not determine project directory for this channel',
                 ephemeral: true,
               })
               return
             }
 
             const row = getDatabase()
-              .prepare('SELECT session_id FROM thread_sessions WHERE thread_id = ?')
+              .prepare(
+                'SELECT session_id FROM thread_sessions WHERE thread_id = ?',
+              )
               .get(channel.id) as { session_id: string } | undefined
 
             if (!row?.session_id) {
@@ -3300,8 +3435,12 @@ export async function startDiscordBot({
                 return
               }
 
-              await command.reply(`🔗 **Session shared:** ${response.data.share.url}`)
-              sessionLogger.log(`Session ${sessionId} shared: ${response.data.share.url}`)
+              await command.reply(
+                `🔗 **Session shared:** ${response.data.share.url}`,
+              )
+              sessionLogger.log(
+                `Session ${sessionId} shared: ${response.data.share.url}`,
+              )
             } catch (error) {
               voiceLogger.error('[SHARE] Error:', error)
               await command.reply({
@@ -3329,7 +3468,8 @@ export async function startDiscordBot({
 
             if (!isThread) {
               await command.reply({
-                content: 'This command can only be used in a thread with an active session',
+                content:
+                  'This command can only be used in a thread with an active session',
                 ephemeral: true,
               })
               return
@@ -3339,7 +3479,8 @@ export async function startDiscordBot({
             const parts = modelInput.split('/')
             if (parts.length < 2) {
               await command.reply({
-                content: 'Invalid model format. Use provider/model (e.g., anthropic/claude-sonnet-4-20250514)',
+                content:
+                  'Invalid model format. Use provider/model (e.g., anthropic/claude-sonnet-4-20250514)',
                 ephemeral: true,
               })
               return
@@ -3355,8 +3496,12 @@ export async function startDiscordBot({
               )
               .run(channel.id, providerID, modelID)
 
-            await command.reply(`🔄 **Model changed** to \`${modelInput}\` for this session`)
-            sessionLogger.log(`Thread ${channel.id} model set to ${providerID}/${modelID}`)
+            await command.reply(
+              `🔄 **Model changed** to \`${modelInput}\` for this session`,
+            )
+            sessionLogger.log(
+              `Thread ${channel.id} model set to ${providerID}/${modelID}`,
+            )
           }
         }
       } catch (error) {
@@ -3505,7 +3650,9 @@ export async function startDiscordBot({
                 m.id === guild.ownerId ||
                 m.permissions.has(PermissionsBitField.Flags.Administrator) ||
                 m.permissions.has(PermissionsBitField.Flags.ManageGuild) ||
-                m.roles.cache.some((role) => role.name.toLowerCase() === 'kimaki')
+                m.roles.cache.some(
+                  (role) => role.name.toLowerCase() === 'kimaki',
+                )
               )
             })
 
