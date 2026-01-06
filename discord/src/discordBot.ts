@@ -1801,7 +1801,7 @@ async function handleOpencodeSession({
 
       // Keep typing indicator active during prompt execution
       thread.sendTyping().catch(() => {})
-      response = await getClient().session.prompt({
+      response = await getClient().session.promptAsync({
         path: { id: session.id },
         body: {
           parts,
@@ -1838,7 +1838,9 @@ async function handleOpencodeSession({
       )
     }
 
-    sessionLogger.log(`Successfully sent prompt, got response`)
+    sessionLogger.log(
+      `Prompt accepted (async), status ${response.response.status}`,
+    )
 
     // Update reaction to success
     if (originalMessage) {
