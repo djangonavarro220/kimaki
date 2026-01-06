@@ -40,6 +40,11 @@ export interface WatcherDependencies {
     content: string,
   ) => Promise<Message>
   formatPart: (part: Part) => string
+  onSessionIdle?: (params: {
+    sessionId: string
+    threadId: string
+    parentMessageId?: string
+  }) => void
 }
 
 export interface WatcherOptions {
@@ -114,6 +119,7 @@ export class GlobalEventWatcher {
     string,
     { tool: string; input?: any; output?: any; error?: any }
   >()
+  private toolFallbackSent = new Set<string>()
 
   private autoResumeNewSessions: boolean
   private autoResumeSince: number
@@ -1016,9 +1022,11 @@ export class GlobalEventWatcher {
             if (activeInteraction) {
               for (const mid of activeInteraction.messageIds) {
                 this.messageTextBuffers.delete(mid)
+                this.toolFallbackSent.delete(mid)
               }
             } else {
               this.messageTextBuffers.delete(msg.id)
+              this.toolFallbackSent.delete(msg.id)
             }
 
             try {
@@ -1042,6 +1050,50 @@ export class GlobalEventWatcher {
               }
             } catch (e) {
               watcherLogger.error(`Failed to update completion status:`, e)
+            }
+
+            this.deps.onSessionIdle?.({
+              sessionId,
+              threadId,
+              parentMessageId: msg.parentID,
+            })
+          }
+
+          if (msg.role === 'assistant' && msg.finish === 'tool-calls') {
+            const textParts = (msg.parts || [])
+              .filter((part: any) => part.type === 'text')
+              .map((part: any) => part.text)
+              .join('')
+            const bufferedText = this.messageTextBuffers.get(msg.id) || ''
+            const finalText = textParts.trim() ? textParts : bufferedText
+
+            if (!finalText.trim() && !this.toolFallbackSent.has(msg.id)) {
+              const toolParts = (msg.parts || []).filter(
+                (part: any) => part.type === 'tool',
+              )
+              const toolOutput = toolParts
+                .map((part: any) => {
+                  const toolName =
+                    typeof part.tool === 'string' ? part.tool : 'tool'
+                  const state = part.state || {}
+                  const summary = this.summarizeToolOutput(
+                    toolName,
+                    state.output ?? state.error ?? state,
+                  )
+                  const body = summary.preview?.trim() || summary.summary
+                  if (!body) return ''
+                  return `🧰 \`${toolName}\` output\n${body}`
+                })
+                .filter((entry: string) => entry)
+                .join('\n\n')
+
+              if (toolOutput.trim()) {
+                const chunks = splitDiscordMessage(toolOutput)
+                for (const chunk of chunks) {
+                  await this.deps.sendThreadMessage(thread, chunk)
+                }
+                this.toolFallbackSent.add(msg.id)
+              }
             }
           }
         }
@@ -1158,6 +1210,7 @@ export class GlobalEventWatcher {
       if (activeInteraction) {
         for (const mid of activeInteraction.messageIds) {
           this.messageTextBuffers.delete(mid)
+          this.toolFallbackSent.delete(mid)
           const parts = this.messageReasoningParts.get(mid)
           if (parts) {
             for (const partId of parts) {
@@ -1174,6 +1227,7 @@ export class GlobalEventWatcher {
       if (activeInteraction) {
         for (const mid of activeInteraction.messageIds) {
           this.messageTextBuffers.delete(mid)
+          this.toolFallbackSent.delete(mid)
           const parts = this.messageReasoningParts.get(mid)
           if (parts) {
             for (const partId of parts) {

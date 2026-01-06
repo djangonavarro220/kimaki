@@ -36,6 +36,7 @@ import {
 } from '@discordjs/voice'
 import { Lexer } from 'marked'
 import { spawn, exec, type ChildProcess } from 'node:child_process'
+import crypto from 'node:crypto'
 import fs, { createWriteStream } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import net from 'node:net'
@@ -222,6 +223,24 @@ const pendingPermissions = new Map<
   string,
   { permission: Permission; messageId: string; directory: string }
 >()
+
+type PromptQueueItem = {
+  prompt: string
+  thread: ThreadChannel
+  projectDirectory?: string
+  originalMessage?: Message
+  images?: FilePartInput[]
+  parsedCommand?: ParsedCommand
+  messageId?: string
+}
+
+type PromptQueueState = {
+  inFlight: boolean
+  inFlightMessageId?: string
+  items: PromptQueueItem[]
+}
+
+const promptQueues = new Map<string, PromptQueueState>()
 
 // Authoritative Sync: Global event watcher instance (initialized in startDiscordBot)
 let globalEventWatcher: GlobalEventWatcher | null = null
@@ -1666,6 +1685,7 @@ async function handleOpencodeSession({
   originalMessage,
   images = [],
   parsedCommand,
+  messageId,
 }: {
   prompt: string
   thread: ThreadChannel
@@ -1673,7 +1693,9 @@ async function handleOpencodeSession({
   originalMessage?: Message
   images?: FilePartInput[]
   parsedCommand?: ParsedCommand
+  messageId?: string
 }): Promise<{ sessionID: string; result: any; port?: number } | undefined> {
+
   voiceLogger.log(
     `[OPENCODE SESSION] Starting for thread ${thread.id} with prompt: "${prompt.slice(0, 50)}${prompt.length > 50 ? '...' : ''}"`,
   )
@@ -1804,6 +1826,7 @@ async function handleOpencodeSession({
       response = await getClient().session.promptAsync({
         path: { id: session.id },
         body: {
+          messageID: messageId,
           parts,
           system: getOpencodeSystemMessage({ sessionId: session.id }),
           model: threadModel,
@@ -1852,7 +1875,11 @@ async function handleOpencodeSession({
       }
     }
 
-    return { sessionID: session.id, result: response.data, port }
+    return {
+      sessionID: session.id,
+      result: response.data,
+      port,
+    }
   } catch (error) {
     sessionLogger.error(`ERROR: Failed to send prompt:`, error)
 
@@ -1892,6 +1919,89 @@ async function handleOpencodeSession({
       `✗ Unexpected bot Error: [${errorName}]\n${errorMsg}`,
     )
   }
+}
+
+async function enqueuePromptForThread(item: PromptQueueItem): Promise<void> {
+  if (item.parsedCommand) {
+    await handleOpencodeSession(item)
+    return
+  }
+
+  const queue = promptQueues.get(item.thread.id) ?? {
+    inFlight: false,
+    items: [],
+  }
+
+  queue.items.push(item)
+  promptQueues.set(item.thread.id, queue)
+
+  if (!queue.inFlight) {
+    void dispatchQueuedPrompt({ threadId: item.thread.id })
+  }
+}
+
+function handleQueuedPromptCompletion({
+  threadId,
+  parentMessageId,
+}: {
+  threadId: string
+  parentMessageId?: string
+}): void {
+  const queue = promptQueues.get(threadId)
+  if (!queue || !queue.inFlight) return
+
+  if (queue.inFlightMessageId && parentMessageId) {
+    if (queue.inFlightMessageId !== parentMessageId) {
+      return
+    }
+  } else if (queue.inFlightMessageId) {
+    return
+  }
+
+  queue.inFlight = false
+  queue.inFlightMessageId = undefined
+
+  if (queue.items.length > 0) {
+    void dispatchQueuedPrompt({ threadId })
+    return
+  }
+
+  promptQueues.delete(threadId)
+}
+
+async function dispatchQueuedPrompt({
+  threadId,
+}: {
+  threadId: string
+}): Promise<void> {
+  const queue = promptQueues.get(threadId)
+  if (!queue || queue.inFlight) return
+
+  const next = queue.items.shift()
+  if (!next) {
+    promptQueues.delete(threadId)
+    return
+  }
+
+  const messageId = `msg_${crypto.randomUUID()}`
+
+  queue.inFlight = true
+  queue.inFlightMessageId = messageId
+
+  const result = await handleOpencodeSession({
+    ...next,
+    messageId,
+  })
+  if (result) return
+
+  queue.inFlight = false
+  queue.inFlightMessageId = undefined
+  if (queue.items.length > 0) {
+    void dispatchQueuedPrompt({ threadId })
+    return
+  }
+
+  promptQueues.delete(threadId)
 }
 
 export type ChannelWithTags = {
@@ -1969,6 +2079,9 @@ export async function startDiscordBot({
         getDiscordClient: () => c,
         sendThreadMessage,
         formatPart,
+        onSessionIdle: ({ threadId, parentMessageId }) => {
+          handleQueuedPromptCompletion({ threadId, parentMessageId })
+        },
       }
 
       const autoResumeNewSessions = parseBooleanEnv(
@@ -2250,7 +2363,7 @@ export async function startDiscordBot({
           ? `${messageContent}\n\n${textAttachmentsContent}`
           : messageContent
         const parsedCommand = parseSlashCommand(messageContent)
-        await handleOpencodeSession({
+        await enqueuePromptForThread({
           prompt: promptWithAttachments,
           thread,
           projectDirectory,
@@ -2351,7 +2464,7 @@ export async function startDiscordBot({
           ? `${messageContent}\n\n${textAttachmentsContent}`
           : messageContent
         const parsedCommand = parseSlashCommand(messageContent)
-        await handleOpencodeSession({
+        await enqueuePromptForThread({
           prompt: promptWithAttachments,
           thread,
           projectDirectory,
