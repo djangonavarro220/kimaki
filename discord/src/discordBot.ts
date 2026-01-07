@@ -3617,6 +3617,94 @@ export async function startDiscordBot({
             sessionLogger.log(
               `Thread ${channel.id} model set to ${providerID}/${modelID}`,
             )
+          } else if (command.commandName === 'close') {
+            const channel = command.channel
+
+            if (!channel) {
+              await command.reply({
+                content: 'This command can only be used in a channel',
+                ephemeral: true,
+              })
+              return
+            }
+
+            const isThread = [
+              ChannelType.PublicThread,
+              ChannelType.PrivateThread,
+              ChannelType.AnnouncementThread,
+            ].includes(channel.type)
+
+            if (!isThread) {
+              await command.reply({
+                content: '❌ This command can only be used in threads.',
+                ephemeral: true,
+              })
+              return
+            }
+
+            const thread = channel as ThreadChannel
+
+            // Get session ID from database
+            const row = getDatabase()
+              .prepare('SELECT session_id FROM thread_sessions WHERE thread_id = ?')
+              .get(thread.id) as { session_id: string } | undefined
+
+            // Get directory for the thread
+            const directoryRow = getDatabase()
+              .prepare('SELECT directory FROM thread_directories WHERE thread_id = ?')
+              .get(thread.id) as { directory: string } | undefined
+
+            // If no directory from thread_directories, try parent channel
+            let directory = directoryRow?.directory
+            if (!directory) {
+              const textChannel = resolveTextChannel(thread)
+              const metadata = getKimakiMetadata(textChannel)
+              directory = metadata.projectDirectory
+            }
+
+            await command.reply('🔒 Closing thread...')
+
+            try {
+              // Step 1: Delete session via API (if exists)
+              if (row?.session_id && directory) {
+                try {
+                  const getClient = await initializeOpencodeForDirectory(directory)
+                  await getClient().session.delete({
+                    path: { id: row.session_id },
+                  })
+                  sessionLogger.log(`Deleted session ${row.session_id}`)
+                } catch (error) {
+                  sessionLogger.log(`Session delete failed (may already be deleted):`, error)
+                }
+              }
+
+              // Step 2: Remove DB mappings
+              getDatabase()
+                .prepare('DELETE FROM thread_sessions WHERE thread_id = ?')
+                .run(thread.id)
+              getDatabase()
+                .prepare('DELETE FROM thread_directories WHERE thread_id = ?')
+                .run(thread.id)
+              getDatabase()
+                .prepare('DELETE FROM thread_models WHERE thread_id = ?')
+                .run(thread.id)
+              getDatabase()
+                .prepare('DELETE FROM part_messages WHERE thread_id = ?')
+                .run(thread.id)
+              dbLogger.log(`Removed all DB mappings for thread ${thread.id}`)
+
+              // Step 3: Lock and archive the thread
+              await thread.setLocked(true, `Closed by ${command.user.tag}`)
+              await thread.setArchived(true)
+
+              sessionLogger.log(`Thread ${thread.id} closed and archived by ${command.user.tag}`)
+            } catch (error) {
+              discordLogger.error('[CLOSE] Error closing thread:', error)
+              await command.followUp({
+                content: `❌ Failed to close thread: ${error instanceof Error ? error.message : String(error)}`,
+                ephemeral: true,
+              })
+            }
           }
         }
       } catch (error) {

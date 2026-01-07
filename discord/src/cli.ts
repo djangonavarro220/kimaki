@@ -193,6 +193,10 @@ async function registerCommands(token: string, appId: string) {
         return option
       })
       .toJSON(),
+    new SlashCommandBuilder()
+      .setName('close')
+      .setDescription('Close, lock, and archive the current thread (deletes session)')
+      .toJSON(),
   ]
 
   const rest = new REST().setToken(token)
