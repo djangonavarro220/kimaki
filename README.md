@@ -18,6 +18,8 @@ Kimaki will store the bot state in a local sqlite database. You should keep the 
 - **Authoritative Sync** - Connects to a persistent OpenCode server (port 39293) to sync all interactions (TUI, API, and Bot) to Discord in real-time.
 - **Universal Resumption** - Resumes existing sessions with full history backfill.
 - **Rich Meta-info** - Displays token usage, context cache, and model details in Discord subtext.
+- **Shadow Threads** - Reasoning traces and tool logs stream to a separate thread to keep the main conversation clean.
+- **Message Queuing** - Multiple prompts are queued per-thread and dispatched sequentially, preventing race conditions.
 
 ## Usage
 
@@ -60,3 +62,13 @@ Examples:
 - `"google/gemini-2.5-pro"` - Gemini 2.5 Pro
 
 Format is `provider/model-name`. You can also set `small_model` for tasks like title generation.
+
+## Slash Commands
+
+| Command | Description |
+|---------|-------------|
+| `/model` | Change the model for the current session (with autocomplete) |
+| `/close` | Lock, archive the thread and delete the OpenCode session |
+| `/resume` | Resume an existing session in a new thread |
+| `/share` | Share current session as a public URL |
+| `/add-new-project` | Create a new project folder and start a session |

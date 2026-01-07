@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.6.0
+
+### Minor Changes
+
+- **Shadow Threads**: Reasoning traces and tool logs now stream to a separate "shadow" thread, keeping the main conversation clean. Includes live status updates and safe markdown formatting.
+- **`/model` Command**: Change the model for the current session directly from Discord with provider/model autocomplete.
+- **`/close` Command**: Lock, archive the thread and delete the associated OpenCode session. Cleans up all database mappings.
+- **Message Queuing**: Multiple prompts per-thread are queued and dispatched sequentially using `prompt_async`, preventing race conditions when sending rapid messages.
+- **Auto-Resume Sessions**: New OpenCode sessions are automatically resumed when the bot reconnects.
+- **Thread-Session Title Sync**: Thread names automatically sync with session titles.
+
+### Patch Changes
+
+- **SSE-Only Delivery**: Enforce SSE streaming with `safeSend`; removed polling fallback for cleaner architecture.
+- **Graceful Server Restart Handling**: Bot handles OpenCode server restarts without crashing.
+- **Typing Indicator Fix**: Start typing immediately to avoid silent waits.
+- **Markdown Overflow Fix**: Prevent long markdown lines from overflowing Discord's character limits.
+- **Model Autocomplete in Threads**: Fixed model autocomplete to work correctly inside threads.
+- **Backfill Race Condition Fix**: Prevent message truncation from backfill race conditions.
+- **Periodic Backfill**: Added periodic backfill and error handling for events sync.
+- **Echo Detection Improvements**: Improved echo detection and footer timing.
+- **Ignore System Messages**: Properly ignore Discord system messages (thread renames).
+
 ## 0.5.0
 
 ### Minor Changes
