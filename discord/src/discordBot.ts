@@ -2438,7 +2438,7 @@ export async function startDiscordBot({
 
         const thread = await message.startThread({
           name: threadName.slice(0, 80),
-          autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+          autoArchiveDuration: ThreadAutoArchiveDuration.ThreeDays,
           reason: 'Start Claude session',
         })
 
@@ -3005,7 +3005,7 @@ export async function startDiscordBot({
               // Create thread for the resumed session
               const thread = await textChannel.threads.create({
                 name: `Resume: ${sessionTitle}`.slice(0, 100),
-                autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+                autoArchiveDuration: ThreadAutoArchiveDuration.ThreeDays,
                 reason: `Resuming session ${sessionId}`,
               })
 

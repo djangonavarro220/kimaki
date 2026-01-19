@@ -656,7 +656,7 @@ export class GlobalEventWatcher {
     const desiredName = buildThreadTitle(info?.title || '')
     const thread = await textChannel.threads.create({
       name: desiredName,
-      autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+      autoArchiveDuration: ThreadAutoArchiveDuration.ThreeDays,
       reason: `Auto-resume session ${sessionId}`,
     })
 
